@@ -113,6 +113,14 @@ Edge → GW: current_A
 - ボタン入力・SSD1306表示
 - USBシリアル設定
 
+#### AUX割り込みによるコマンド受信
+- AUX(GPIO6) のRISINGエッジで割り込み → `volatile bool auxRise = true` をセット
+- loop()内で `auxRise && Serial2.available() >= 3` を確認してコマンド処理
+  - 受信後のRISING: RXバッファにデータあり → 処理する
+  - 送信後のRISING: RXバッファ空 → スルー（ステート変数不要）
+- これによりloop()はブロックされず、LEDやボタン処理を並行実行可能
+- **起動順序**: `setup()` 内でAUX=HIGHを確認（E220初期化完了）してから `attachInterrupt()` を呼ぶ
+
 ### Core1（センサー常時サンプリング担当）
 - **パトライト**: TSL2561を3ch高速サイクリング
   - 直近1.5秒間の各センサーmax値を保持
