@@ -34,9 +34,9 @@
 | I2C1 SDA | GPIO26 | Wire1 / SSD1306 |
 | I2C1 SCL | GPIO27 | Wire1 / SSD1306 |
 
-## 使用ライブラリ（確定済み）
-- `Wire.h` / `Adafruit_Sensor.h` / `Adafruit_TSL2561_U.h`
-- `SPI.h`（MCP3208）
+## 使用ライブラリ
+- `Wire.h` / `Adafruit_Sensor.h` / `Adafruit_TSL2561_U.h`（確定）
+- `SPI.h`（MCP3208）（確定）
 - SSD1306用ライブラリ（`Adafruit SSD1306` または `U8g2`、Step4で確定）
 
 ## センサー仕様

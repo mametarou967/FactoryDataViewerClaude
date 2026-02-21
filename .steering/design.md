@@ -21,6 +21,7 @@
 
 ## GW設定ファイル構造（案）
 ```yaml
+gw_addr: 0x0000           # GW自身のLoRaアドレス（エッジへの送信元アドレス）
 machines:
   - name: "A214"
     patlite_addr: 0x0001
