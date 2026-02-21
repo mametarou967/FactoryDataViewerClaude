@@ -25,7 +25,11 @@ machines:
   - name: "A214"
     patlite_addr: 0x0001
     current_addr: 0x000C
-    current_thresholds:       # 状態判定の閾値（機械ごとに異なる）
+    patlite_thresholds:       # パトライト点灯判定閾値（lux）
+      red: 200
+      yellow: 200
+      green: 200
+    current_thresholds:       # 電流による状態判定閾値（A）
       idle: 1.0
       auto: 5.0
       manual: 10.0
@@ -34,6 +38,7 @@ machines:
     current_addr: 0x000D
     ...
 ```
+※ 同一ユニットが両機能を兼務する場合は `patlite_addr == current_addr` を設定する
 
 ## CSVフォーマット（新設計）
 - パス: `data/sensor/<機械名>/YYYY-MM-DD.csv`
