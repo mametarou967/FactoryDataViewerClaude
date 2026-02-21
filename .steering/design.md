@@ -52,17 +52,26 @@ app.py
 gw_channel: 18            # 工場ごとに異なるチャンネルを割り当て（電波干渉回避）
 gw_addr: 0x0000           # GW自身のLoRaアドレス（工場内で固定）
 machines:
-  - name: "A214"
-    patlite_addr: 0x0001
-    current_addr: 0x000C
+  - name: "A214"          # 機械1
+    patlite_addr: 0x0101  # machine=1, type=patlite
+    current_addr: 0x0102  # machine=1, type=current
     patlite_thresholds:       # パトライト点灯判定閾値（lux）。閾値以上=点灯
       red: 200
       yellow: 200
       green: 200
     current_threshold: 3.0   # 加工中判定閾値（A）。閾値以上=加工中
-  - name: "B103"
-    patlite_addr: 0x0002
-    current_addr: 0x000D
+  - name: "B103"          # 機械2
+    patlite_addr: 0x0201  # machine=2, type=patlite
+    current_addr: 0x0202  # machine=2, type=current
+    patlite_thresholds:
+      red: 200
+      yellow: 200
+      green: 200
+    current_threshold: 3.0
+  # 兼務ユニットの例（機械11）
+  - name: "C501"          # 機械11
+    patlite_addr: 0x0B03  # machine=11, type=both（兼務）
+    current_addr: 0x0B03  # patlite_addr == current_addr で兼務を表現
     patlite_thresholds:
       red: 200
       yellow: 200
@@ -73,24 +82,36 @@ machines:
 
 ### LoRaアドレス規則（工場内）
 各工場は独自のGW（RPi5 + USB E220）を持ち、チャンネルで工場間を分離する。
-工場内のアドレスは毎回同じ規則で振り直してよい。
+工場内のアドレスは `0xMMTT` 形式で構造化する。
 
-| アドレス範囲 | 用途 |
-|------------|------|
-| 0x0000 | GW（予約） |
-| 0x0001〜0x000B | パトライトユニット（機械1〜11） |
-| 0x000C〜0x0016 | 電流ユニット（機械1〜11） |
+```
+0xMMTT
+  MM: 機械番号（0x01〜0xFF、最大255台）
+  TT: ユニット種別
+      0x01 = パトライト監視ユニット
+      0x02 = 電流監視ユニット
+      0x03 = パトライト+電流兼務ユニット
+      0x04〜 = 将来拡張（振動・温度など）
+0x0000: GW予約
+```
+
+| 例 | アドレス | 意味 |
+|----|---------|------|
+| 機械1 パトライト | 0x0101 | machine=1, type=patlite |
+| 機械7 電流 | 0x0702 | machine=7, type=current |
+| 機械11 兼務 | 0x0B03 | machine=11, type=both |
 
 ### 多工場展開時のチャンネル割り当て例
 | 工場 | チャンネル | アドレス空間 |
 |------|----------|------------|
-| 工場1 | 18 | 0x0000〜0x0016（工場内で完結） |
-| 工場2 | 19 | 0x0000〜0x0016（工場内で完結） |
-| 工場3 | 20 | 0x0000〜0x0016（工場内で完結） |
+| 工場1 | 18 | 0x0000〜0xFF03（工場内で完結） |
+| 工場2 | 19 | 0x0000〜0xFF03（工場内で完結） |
+| 工場3 | 20 | 0x0000〜0xFF03（工場内で完結） |
 
 - 工場ごとにGW・config.yaml・app.pyが独立して稼働
 - チャンネルが異なるため同一建物内でも電波干渉なし
 - 新工場追加 = 新チャンネルを割り当てるだけ
+- アドレスから機械番号・ユニット種別を直読みできるため運用・デバッグが容易
 
 ## CSVフォーマット（新設計）
 - パス: `data/sensor/<機械名>/YYYY-MM-DD.csv`
