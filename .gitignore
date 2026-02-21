@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# Gateway - generated data (CSVやグラフは管理対象外)
+gateway/data/
+gateway/static/*.png
+
+# Arduino build
+build/
+*.elf
+*.bin
+*.hex
+
+# KiCad backup
+*.kicad_sch-bak
+*.kicad_pcb-bak
+*-backups/
+fp-info-cache
+
+# OS
+.DS_Store
+Thumbs.db
