@@ -7,17 +7,45 @@
   ・パトライト監視 (TSL2561 × 3)
   ・電流監視 (CTL-24-CLS + MCP3208)
          ↕ LoRa（ポーリング型）
-[ゲートウェイ]
+[ゲートウェイ: app.py（Flask統合アプリ）]
   Raspberry Pi 5 + USB E220
-  ・ポーリング制御
-  ・データ統合・CSV保存
-  ・品目データ取得（SMB）
-         ↕
-[Webアプリ (Flask)]
-  ・11台の現在状態一覧
-  ・時系列グラフ
-  ・品目突合せ
+  ┌─ ポーリングスレッド（バックグラウンド）
+  │    1分周期: P/Cコマンド → CSV書き込み
+  ├─ コマンドキュー（スレッドセーフ）
+  │    メンテ操作をWebUI→LoRaスレッドへ橋渡し
+  └─ Flaskスレッド（HTTPサーバー）
+       ・11台の現在状態一覧
+       ・時系列グラフ・品目突合せ
+       ・メンテナンス画面（Ping/バージョン/設定/OTA）
+         ↕ ファイル（CSV読み取り）
+[server_file_copy.py（cron独立実行）]
+  ・品目データ取得（SMBファイル同期）
 ```
+
+## GWアプリケーションアーキテクチャ
+
+```
+app.py
+├─ polling_thread（daemon=True）
+│   ├─ 1分周期: 全機械を順次ポーリング（P/Cコマンド）
+│   ├─ データ統合 → CSV書き込み
+│   └─ コマンドキューを監視してメンテ操作を実行
+│         K(Ping) / H(HW情報) / V(バージョン) / U(OTA)
+│         → 結果をresult_queueに返す
+└─ Flask routes
+    ├─ /           監視画面（11台状態一覧）
+    ├─ /graph      時系列グラフ
+    ├─ /hinmoku    品目突合せ
+    └─ /maintenance メンテナンス画面
+        ├─ POST /api/ping      → cmd_queueにKコマンドを積む
+        ├─ POST /api/version   → cmd_queueにVコマンドを積む
+        ├─ POST /api/hwinfo    → cmd_queueにHコマンドを積む
+        └─ POST /api/ota       → cmd_queueにUコマンドを積む（Phase5）
+```
+
+- シリアルポート（E220）はpolling_threadが一元管理
+- メンテ操作はFlask側からキュー経由で依頼し、結果を受け取る
+- 信頼性: systemdの `Restart=always` でプロセス障害時に自動再起動
 
 ## GW設定ファイル構造（案）
 ```yaml
@@ -95,15 +123,26 @@ machines:
 | 再送後も無応答 | スキップして次のユニットへ |
 - 最悪ケース: 22ユニット × (500ms × 2回) = 22秒 → 1分以内に収まる
 
-### ポーリングシーケンス
+### ポーリングシーケンス（1分周期・定期自動実行）
 ```
-GW → Edge[patlite_addr]: パトライトデータ要求
+GW → Edge[patlite_addr]: パトライトデータ要求 ('P')
 Edge → GW: red_lux, yellow_lux, green_lux
-GW → Edge[current_addr]: 電流データ要求
+GW → Edge[current_addr]: 電流データ要求 ('C')
 Edge → GW: current_A
 → 2ユニットのデータを統合して1行のCSVに記録
-→ 次の機械へ（22ユニット完了まで繰り返し、1分以内に完了）
+→ 次の機械へ（全機械完了まで繰り返し、1分以内に完了）
 ```
+
+### メンテナンス操作（Web UIからオンデマンド実行）
+K/H/V/U コマンドは定期ポーリングには含まれない。
+Webメンテナンス画面から手動トリガーし、コマンドキュー経由でpolling_threadが実行する。
+
+| コマンド | 用途 | 実行タイミング |
+|---------|------|-------------|
+| `'K'` Ping | 死活確認（全台 or 個別） | 手動 |
+| `'H'` HW情報 | DIP状態・E220設定値確認 | 手動 |
+| `'V'` バージョン | ファーム確認（全台 or 個別） | 手動 |
+| `'U'` OTA | ファームウェア更新 | 手動（Phase5） |
 
 ## デュアルコアアーキテクチャ
 
