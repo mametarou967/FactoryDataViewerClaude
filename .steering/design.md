@@ -195,13 +195,40 @@ Webメンテナンス画面から手動トリガーし、コマンドキュー�
 ### コア間データ共有（mutex保護）
 ```
 shared_data {
-    float patlite_max[3];   // 赤・黄・緑の直近1.5秒max値 (lux)
-    float current_rms;      // 最新RMS電流値 (A)
-    bool  sensor_error;     // センサー異常フラグ
+    float    patlite_max[3];    // 赤・黄・緑の直近1.5秒max値 (lux)
+    float    current_rms;       // 最新RMS電流値 (A)
+    bool     sensor_error;      // センサー異常フラグ
+    uint32_t core1_heartbeat;   // Core1生存確認カウンタ（loop1()内でインクリメント）
 }
 ```
 - `#include <pico/mutex.h>` の `mutex_t` を使用
 - Core1が書き込み、Core0がコマンド応答時に読み出し
+
+### D1ハートビートLEDによるデュアルコア監視
+Core0のみ生存確認では不十分なため、Core1のカウンタを使って両コアを監視する。
+
+```cpp
+// Core1: loop1()内でカウンタを更新
+void loop1() {
+    // センサーサンプリング処理...
+    mutex_enter_blocking(&shared_mutex);
+    shared_data.core1_heartbeat++;
+    mutex_exit(&shared_mutex);
+}
+
+// Core0: 1秒ごとにカウンタ変化を確認してD1を制御
+uint32_t last_core1_hb = 0;
+void updateHeartbeat() {
+    uint32_t current_hb = shared_data.core1_heartbeat;  // mutex省略可（読み取りのみ）
+    bool core1_alive = (current_hb != last_core1_hb);
+    last_core1_hb = current_hb;
+    if (core1_alive) digitalWrite(PIN_LED_D1, !digitalRead(PIN_LED_D1));
+    // Core1フリーズ時はカウンタが変わらず → D1点滅停止
+}
+```
+- Core0フリーズ → D1点滅停止（従来通り）
+- Core1フリーズ → カウンタ不変 → D1点滅停止
+- 両方正常 → D1が1秒周期で点滅
 - **注意**: Wire / Wire1 / SPI は必ずCore0の `setup()` 内で初期化すること
   （arduino-picoでは `setup1()` は `setup()` 完了後に起動されるため安全）
 
