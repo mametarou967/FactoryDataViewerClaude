@@ -1,0 +1,23 @@
+{% extends "hinmoku_base.html" %}
+{% block hinmoku_body %}
+  <h2>{{ date }} の品目 #{{ hinmokuno }} 稼働時間集計（単位: 時間）</h2>
+
+    <h3>状態別 合計時間（本日のこの手配番号の着手〜完了の区間のみ）</h3>
+    <table border="1">
+        <tr><th>状態</th><th>合計時間（時間）</th></tr>
+        {% for state, hours in durations.items() %}
+        <tr>
+            <td>{{ state }}</td>
+            <td>{{ hours }}</td>
+        </tr>
+        {% endfor %}
+        <tfoot>
+            <tr>
+                <th>合計</th>
+                <th>{{ durations.values() | sum | round(2) }}</th>
+            </tr>
+        </tfoot>
+    </table>
+
+    <p><a href="/date/{{ date }}/hinmoku/{{ hinmokuno }}">グラフ表示へ戻る</a></p>
+{% endblock %}

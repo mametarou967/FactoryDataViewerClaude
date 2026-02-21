@@ -1,0 +1,19 @@
+{% extends "date_base.html" %}
+{% block date_body %}
+    <table border="1">
+        <tr>
+            <th>状態</th><th>合計時間</th>
+        </tr>
+        {% for state, hours in durations.items() %}
+        <tr>
+            <td>{{ state }}</td><td>{{ hours }}</td>
+        </tr>
+        {% endfor %}
+        <tfoot>
+            <tr>
+                <th>合計</th>
+                <th>{{ durations.values() | sum | round(2) }}</th>
+            </tr>
+        </tfoot>
+    </table>
+{% endblock %}

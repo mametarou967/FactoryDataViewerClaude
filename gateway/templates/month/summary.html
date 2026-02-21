@@ -1,0 +1,108 @@
+{% extends "month_base.html" %}
+{% block month_body %}
+
+    <h2>定時(8:00〜17:00) 9Hベース</h2>
+
+    {% if labels_9h %}
+        <h3>稼働率 表（8:00〜17:00）</h3>
+        <table border="1">
+            <tr>
+                <th>状態</th>
+                {% for label in labels_9h %}
+                    <th>{{ label[5:] }}</th>
+                {% endfor %}
+                <th>合計(時間)</th>
+            </tr>
+
+            {% for state in states %}
+            <tr>
+                <td>
+                    {% if state == "自動加工中" %}自動加工中（緑）
+                    {% elif state == "手動加工中" %}手動加工中（青）
+                    {% elif state == "加工完了" %}加工完了（黄）
+                    {% elif state == "アラーム" %}アラーム（赤）
+                    {% else %}停止（灰）
+                    {% endif %}
+                </td>
+                {% for val in summaries_9h[state] %}
+                    <td>{{ val }}</td>
+                {% endfor %}
+                <td><strong>{{ row_totals_9h[state] }}</strong></td>
+            </tr>
+            {% endfor %}
+            <!-- 稼働時間合計(時間)：自動+手動+完了 -->
+            <tr>
+                <td><strong>稼働時間合計(時間)</strong></td>
+                {% for val in working_column_totals_9h %}
+                    <td><strong>{{ val }}</strong></td>
+                {% endfor %}
+                <td><strong>{{ working_grand_total_9h }}</strong></td>
+            </tr>
+
+            <tr>
+                <td><strong>合計(時間)</strong></td>
+                {% for colsum in column_totals_9h %}
+                    <td><strong>{{ colsum }}</strong></td>
+                {% endfor %}
+                <td><strong>{{ grand_total_9h }}</strong></td>
+            </tr>
+        </table>
+
+        <h3>稼働率 グラフ（8:00〜17:00）</h3>
+        <p>
+            <img src="{{ url_for('static', filename=summary9_png) }}" style="max-width: 100%; height: auto;">
+        </p>
+    {% else %}
+        <p>この月の定時(8:00〜17:00)の有効なデータが見つかりませんでした。</p>
+    {% endif %}
+
+    <hr>
+
+    <h2>24時間勘定（参考として残す）</h2>
+
+    {% if labels %}
+    <table border="1">
+        <tr>
+            <th>状態</th>
+            {% for label in labels %}
+                <th>{{ label[5:] }}</th>
+            {% endfor %}
+            <th>合計(時間)</th>
+        </tr>
+        {% for state in states %}
+        <tr>
+            <td>
+                {% if state == "自動加工中" %}自動加工中（緑）
+                {% elif state == "手動加工中" %}手動加工中（青）
+                {% elif state == "加工完了" %}加工完了（黄）
+                {% elif state == "アラーム" %}アラーム（赤）
+                {% else %}停止（灰）
+                {% endif %}
+            </td>
+            {% for val in summaries[state] %}
+                <td>{{ val }}</td>
+            {% endfor %}
+            <td><strong>{{ row_totals[state] }}</strong></td>
+        </tr>
+        {% endfor %}
+        <!-- 稼働時間合計(時間)：自動+手動+完了 -->
+        <tr>
+            <td><strong>稼働時間合計(時間)</strong></td>
+            {% for val in working_column_totals_24h %}
+                <td><strong>{{ val }}</strong></td>
+            {% endfor %}
+            <td><strong>{{ working_grand_total_24h }}</strong></td>
+        </tr>
+        <tr>
+            <td><strong>合計(時間)</strong></td>
+            {% for colsum in column_totals %}
+                <td><strong>{{ colsum }}</strong></td>
+            {% endfor %}
+            <td><strong>{{ grand_total }}</strong></td>
+        </tr>
+    </table>
+    {% else %}
+        <p>この月の有効なデータが見つかりませんでした。</p>
+    {% endif %}
+
+{% endblock %}

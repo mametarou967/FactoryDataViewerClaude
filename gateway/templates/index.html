@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>現在の状態</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 12px; }
+        a { text-decoration: none; }
+        .divider { margin: 0 6px; color: #888; }
+
+        /* --- 上部2カラム --- */
+        .topgrid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            align-items: start;
+        }
+        .card { border:1px solid #ddd; border-radius:8px; padding:8px; background:#fff; }
+        .card h2 { margin: 0 0 6px; font-size: 18px; }
+        .mini { font-size: 12px; color:#666; }
+        
+        /* --- 状態表示（新：1円） --- */
+        .state-circle {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: 6px solid #888;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            text-align: center;
+            margin: 10px 0;
+            background: #fff;
+            color: #111;
+            padding: 8px;
+            box-sizing: border-box;
+        }
+        .state-gray   { border-color: #888; }
+        .state-green  { border-color: #00cc00; }
+        .state-yellow { border-color: #cccc00; }
+        .state-red    { border-color: #cc0000; }
+        .state-blue   { border-color: #0066cc; }
+
+        /* ライト表示（既存） */
+        .light {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            line-height: 100px;
+            color: white;
+            font-weight: bold;
+            text-align: center;
+            margin: 10px;
+            display: inline-block;
+        }
+        .off-red { background-color: #ffcccc; color: #800000; }
+        .on-red { background-color: #cc0000; }
+        .off-yellow { background-color: #ffffcc; color: #806000; }
+        .on-yellow { background-color: #cccc00; }
+        .off-green { background-color: #ccffcc; color: #006600; }
+        .on-green { background-color: #00cc00; }
+
+        /* 情報テーブル */
+        .tight table { width:100%; border-collapse:collapse; }
+        .tight th, .tight td { border:1px solid #ddd; padding:4px 6px; white-space:nowrap; font-size:12px; }
+        .pill { display:inline-block; padding:2px 6px; border-radius:999px; background:#f5f5f5; font-size:12px; }
+
+        /* 横持ちテーブルのスクロール */
+        .h-scroll { overflow-x: auto; }
+        .wide { min-width: 640px; } /* 列が少ない時の潰れ防止 */
+        .sticky-left { position: sticky; left: 0; background:#fafafa; z-index: 1; }
+
+        /* カレンダー（既存） */
+        .calendar-grid {
+            display: grid;
+            grid-template-columns: repeat(4, auto);
+            gap: 12px;
+            justify-content: start;
+            margin-top: 16px;
+            margin-bottom: 40px;
+        }
+        .calendar-item {
+            padding: 4px;
+            border: 1px solid #ccc;
+            background-color: #fdfdfd;
+            box-shadow: 1px 1px 3px rgba(0, 0, 0, 0.05);
+            display: inline-block;
+        }
+        .calendar-item table { table-layout: auto; }
+        .calendar-item th, .calendar-item td { text-align: center; padding: 2px; }
+        .saturday { background-color: #e0f0ff; color: #004080; }
+        .sunday { background-color: #ffe0e0; color: #800000; }
+    </style>
+</head>
+<body>
+
+  <div class="topgrid">
+    <!-- 左：現在の稼働状況 -->
+    <div class="card">
+      <h2>現在の稼働状況</h2>
+      {% if status_summary %}
+        <div class="state-circle state-{{ status_summary.color }}">
+          {{ status_summary.state }}
+        </div>
+      {% else %}
+        <p>利用可能なデータがありません（過去5分以内）</p>
+      {% endif %}
+    </div>
+
+    <!-- 右：現在の加工状況（横持ち・品目=列） -->
+    <div class="card">
+      <h2>現在の加工状況</h2>
+      {% if current_work['has_csv'] %}
+        {% if current_work['items'] %}
+          <div class="mini">本日 {{ today }} の「開始/停止のいずれかの区間」に現在時刻が含まれる品目を列として表示しています。</div>
+          <div class="h-scroll">
+            <div class="tight wide">
+              <table>
+                <colgroup>
+                  <col style="width: 120px;">
+                  {% for _ in current_work['items'] %}
+                    <col style="min-width: 180px;">
+                  {% endfor %}
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th class="sticky-left">項目</th>
+                    {% for it in current_work['items'] %}
+                      <th>
+                        <span class="pill">品目 #{{ it.index }}</span>
+                        <div>{{ it.info.hinmoku_name }}</div>
+                      </th>
+                    {% endfor %}
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <th class="sticky-left">品目番号</th>
+                    {% for it in current_work['items'] %}
+                      <td>{{ it.info.hinmoku_no }}</td>
+                    {% endfor %}
+                  </tr>
+                  <tr>
+                    <th class="sticky-left">機械番号</th>
+                    {% for it in current_work['items'] %}
+                      <td>{{ it.info.kikai_no }}</td>
+                    {% endfor %}
+                  </tr>
+                  <tr>
+                    <th class="sticky-left">製番</th>
+                    {% for it in current_work['items'] %}
+                      <td>{{ it.info.seiban }}</td>
+                    {% endfor %}
+                  </tr>
+                  <tr>
+                    <th class="sticky-left">手配番号</th>
+                    {% for it in current_work['items'] %}
+                      <td>{{ it.info.tehai_no }}</td>
+                    {% endfor %}
+                  </tr>
+                  <tr>
+                    <th class="sticky-left">品目名</th>
+                    {% for it in current_work['items'] %}
+                      <td>{{ it.info.hinmoku_name }}</td>
+                    {% endfor %}
+                  </tr>
+                  <tr>
+                    <th class="sticky-left">状態</th>
+                    {% for it in current_work['items'] %}
+                      <td>{{ it.info.status }}</td>
+                    {% endfor %}
+                  </tr>
+                  <tr>
+                    <th class="sticky-left">区間</th>
+                    {% for it in current_work['items'] %}
+                      <td>{{ it.info.intervals }}</td>
+                    {% endfor %}
+                  </tr>
+                  <tr>
+                    <th class="sticky-left">リンク</th>
+                    {% for it in current_work['items'] %}
+                      <td>
+                        <a href="/date/{{ today }}/hinmoku/{{ it.index }}">グラフ</a>
+                        <span class="divider">|</span><a href="/date/{{ today }}/hinmoku/{{ it.index }}/summary">集計</a>
+                        <span class="divider">|</span><a href="/date/{{ today }}/hinmoku/{{ it.index }}/info">手配情報</a>
+                      </td>
+                    {% endfor %}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        {% else %}
+          <p>本日時点で加工中の品目はありません。</p>
+        {% endif %}
+      {% else %}
+        <p>本日の品目CSVが見つかりません（期待ファイル：{{ current_work['expected'] }}）。</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- カレンダー -->
+  <h2 style="margin-top:20px;">年度カレンダー（{{ calendar|length }}ヶ月分）</h2>
+  <div class="calendar-grid">
+    {% for ym, data in calendar.items() %}
+      <div class="calendar-item">
+        <h3>
+          {% if data.month_link %}
+            <a href="/month/{{ ym }}/overview">{{ ym }}</a>
+          {% else %}
+            {{ ym }}
+          {% endif %}
+        </h3>
+        <table border="1" cellspacing="0" cellpadding="4">
+          <tr>
+            {% for day_name in ['月', '火', '水', '木', '金', '土', '日'] %}
+              <th class="{% if loop.index0 == 5 %}saturday{% elif loop.index0 == 6 %}sunday{% endif %}">
+                {{ day_name }}
+              </th>
+            {% endfor %}
+          </tr>
+          {% for week in data.weeks %}
+          <tr>
+            {% for day in week %}
+              {% if day is none %}
+                <td></td>
+              {% else %}
+                {% set weekday = loop.index0 %}
+                <td class="{% if weekday == 5 %}saturday{% elif weekday == 6 %}sunday{% endif %}">
+                  {% if day.link %}
+                    <a href="/date/{{ day.date }}/overview">{{ day.day }}</a>
+                  {% else %}
+                    {{ day.day }}
+                  {% endif %}
+                </td>
+              {% endif %}
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </table>
+      </div>
+    {% endfor %}
+  </div>
+  
+    <!-- デバッグ表示（旧：ライト/電流の3円） -->
+  <div class="card" style="margin-top: 20px;">
+    <h2>デバッグ：ライト/電流の生表示</h2>
+    {% if status %}
+      <div class="light {{ 'on-red' if status.red == '点灯' else 'off-red' }}">{{ status.red }}</div>
+      <div class="light {{ 'on-yellow' if status.yellow == '点灯' else 'off-yellow' }}">{{ status.yellow }}</div>
+      <div class="light {{ 'on-green' if status.green == '点灯' else 'off-green' }}">{{ status.green }}</div>
+      <p>電流値：{{ status.current }} A</p>
+      <p>データ取得時刻：{{ status.timestamp }}</p>
+    {% else %}
+      <p>利用可能なデータがありません（過去5分以内）</p>
+    {% endif %}
+
+    <div class="mini">
+      閾値設定：
+      パトライト赤={{ thresholds.red }} / 黄={{ thresholds.yellow }} / 緑={{ thresholds.green }}（ルクス）、
+      機械動作={{ current_threshold }}A 以上
+    </div>
+  </div>
+
+</body>
+</html>

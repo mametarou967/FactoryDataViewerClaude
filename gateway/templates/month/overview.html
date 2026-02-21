@@ -1,0 +1,71 @@
+{% extends "month_base.html" %}
+{% block title %}{{ year_month }} の俯瞰表示{% endblock %}
+
+{% block month_body %}
+<style>
+  .mo-grid { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; }
+  .mo-row { display: contents; } /* 1行=2セル（左=サマリ、右=グラフ） */
+  .card { border:1px solid #ddd; border-radius:8px; padding:8px; background:#fff; }
+  .card h4 { margin: 0 0 6px; font-size: 14px; color:#333; }
+  .mini { font-size: 12px; color:#666; }
+  .tight table { width:100%; border-collapse:collapse; }
+  .tight th, .tight td { border:1px solid #ddd; padding:4px 6px; white-space:nowrap; font-size:12px; }
+  .imgwrap { min-height: 120px; display:flex; align-items:center; justify-content:center; }
+  .imgwrap img { width:100%; height:auto; display:block; }
+  .dayhead { font-weight:600; }
+</style>
+
+<h2>{{ year_month }} の俯瞰表示</h2>
+<p class="mini">左列が各日の「稼働時間集計（templates/date/summary.html 相当）」、右列が各日の「日別グラフ（templates/month/graph.html 相当）」です。</p>
+
+<div class="mo-grid">
+  {% for it in items %}
+    <div class="mo-row">
+      <!-- 左列：日別サマリ -->
+      <div class="card">
+        <h4 class="dayhead">
+          <a href="/date/{{ it.date }}/summary">{{ it.date }}</a>
+          <span class="divider">|</span>
+          <a href="/date/{{ it.date }}/overview">日の俯瞰</a>
+        </h4>
+
+        {% if it.durations %}
+          <div class="tight">
+            <table>
+              <thead><tr><th>状態</th><th>合計時間(h)</th></tr></thead>
+              <tbody>
+                {% for state, hours in it.durations.items() %}
+                  <tr><td>{{ state }}</td><td>{{ hours }}</td></tr>
+                {% endfor %}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <th>合計</th>
+                  <th>{{ it.durations.values() | sum | round(2) }}</th>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        {% else %}
+          <div class="mini">データなし（CSV未存在）</div>
+        {% endif %}
+      </div>
+
+      <!-- 右列：日別グラフ -->
+      <div class="card imgwrap">
+        {% if it.image_filename %}
+          <a href="/date/{{ it.date }}/graph" title="{{ it.date }} のグラフ">
+            <img
+              src="/static/{{ it.image_filename }}"
+              alt="{{ it.date }} のグラフ"
+              style="width: 100%; height: auto; display: block;"
+            >
+          </a>
+        {% else %}
+          <div class="mini">グラフなし（データなし）</div>
+        {% endif %}
+      </div>
+    </div>
+  {% endfor %}
+</div>
+{% endblock %}

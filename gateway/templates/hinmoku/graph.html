@@ -1,0 +1,6 @@
+{% extends "hinmoku_base.html" %}
+{% block title %}{{ date }} 品目 {{ hinmokuno }} の区間グラフ{% endblock %}
+{% block hinmoku_body %}
+  <h2>{{ date }} 品目 {{ hinmokuno }} の区間グラフ</h2>
+  <img src="/static/{{ image_filename }}" alt="品目区間グラフ" style="width:100%;">
+{% endblock %}

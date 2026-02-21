@@ -1,0 +1,30 @@
+{% extends "date_base.html" %}
+{% block date_body %}
+  {% if not has_data %}
+    <p class="msg">品目リストはありません</p>
+  {% else %}
+    <p class="caption">表示ファイル: {{ filename }} ／ 全{{ records|length }}件</p>
+    <div style="overflow:auto;">
+      <table>
+        <thead>
+          <tr>
+            {% for h in headers %}
+              <th>{{ h }}</th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {# records は (行番号, 元行[]) のタプル #}
+          {% for idx, row in records %}
+            <tr>
+              <td><a href="/date/{{ date }}/hinmoku/{{ idx }}">{{ idx }}</a></td>
+              {% for col in row %}
+                <td>{{ col }}</td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endblock %}

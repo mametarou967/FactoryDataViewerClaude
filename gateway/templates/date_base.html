@@ -1,0 +1,19 @@
+{% extends "month_base.html" %}
+
+{% block nav_below_month %}
+  {{ super() }}
+  <div class="line">
+    <span>{{ date }}</span>
+    <span class="divider">|</span><a href="/date/{{ date }}/overview">俯瞰表示</a>
+    <span class="divider">|</span><a href="/date/{{ date }}/graph">グラフ表示</a>
+    <span class="divider">|</span><a href="/date/{{ date }}/summary">稼働時間集計表示</a>
+    <span class="divider">|</span><a href="/date/{{ date }}/status">状態表示</a>
+    <span class="divider">|</span><a href="/date/{{ date }}/table">センサデータ表示</a>
+    <span class="divider">|</span><a href="/date/{{ date }}/hinmoku">品目リスト表示</a>
+  </div>
+  {% block nav_below_date %}{% endblock %}
+{% endblock %}
+
+{% block content %}
+  {% block date_body %}{% endblock %}
+{% endblock %}

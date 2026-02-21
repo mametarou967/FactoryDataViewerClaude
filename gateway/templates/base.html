@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>{% block title %}工場ビューア{% endblock %}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 12px; }
+    .topnav { line-height: 1.7; margin: 8px 0 12px; }
+    .topnav .line { margin: 2px 0; }
+    .divider { margin: 0 6px; color: #888; }
+    a { text-decoration: none; }
+    .caption { color: #666; margin: 6px 0 12px; }
+    table { border-collapse: collapse;  }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; white-space: nowrap; }
+    th { background: #f5f5f5; position: sticky; top: 0; }
+    td a { text-decoration: none; }    
+    th { background-color: #eee; }
+    .on-red { background-color: #cc0000; color: white; }
+    .off-red { background-color: #ffcccc; color: #800000; }
+    .on-yellow { background-color: #cccc00; color: black; }
+    .off-yellow { background-color: #ffffcc; color: #806000; }
+    .on-green { background-color: #00cc00; color: white; }
+    .off-green { background-color: #ccffcc; color: #006600; }
+    .machine-on { background-color: #E0F7FF; color: #555; }
+    .machine-working { background-color: #0000CC; color: white; }
+    .state-green { background-color: green; color: white; }
+    .state-yellow { background-color: yellow; }
+    .state-red { background-color: red; color: white; }
+    .state-orange { background-color: orange; }
+    .state-purple { background-color: purple; color: white; }
+    .state-blue { background-color: #0000CC; color: white; }
+    .state-gray { background-color: #CCC; color: white; }
+  </style>
+</head>
+<body>
+  <div class="topnav">
+    {% block nav %}{% endblock %}
+  </div>
+
+  {% block content %}{% endblock %}
+</body>
+</html>

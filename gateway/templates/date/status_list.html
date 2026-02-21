@@ -1,0 +1,27 @@
+{% extends "date_base.html" %}
+{% block date_body %}
+    <table>
+        <thead>
+            <tr>
+                <th>時刻</th>
+                <th>パトライト赤</th>
+                <th>パトライト黄</th>
+                <th>パトライト緑</th>
+                <th>電流値による機械動作</th>
+                <th>状態</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td>{{ row.time }}</td>
+                <td class="{{ 'on-red' if row.red == '点灯' else 'off-red' }}">{{ row.red }}</td>
+                <td class="{{ 'on-yellow' if row.yellow == '点灯' else 'off-yellow' }}">{{ row.yellow }}</td>
+                <td class="{{ 'on-green' if row.green == '点灯' else 'off-green' }}">{{ row.green }}</td>
+                <td class="{% if row.machine_action == '加工中' %}machine-working{% else %}machine-on{% endif %}">{{ row.machine_action }}</td>
+                <td class="state-{{ row.color }}">{{ row.state }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

@@ -1,0 +1,19 @@
+{% extends "hinmoku_base.html" %}
+{% block hinmoku_body %}
+  <h2>{{ date }} の品目 #{{ hinmokuno }} の情報 </h2>
+    <h3>対象品目情報</h3>
+    <table border="1">
+        <tr><th>機械番号</th><td>{{ row[0] }}</td></tr>
+        <tr><th>製番</th><td>{{ row[1] }}</td></tr>
+        <tr><th>手配番号</th><td>{{ row[2] }}</td></tr>
+        <tr><th>品目番号</th><td>{{ row[3] }}</td></tr>
+        <tr><th>品目名</th><td>{{ row[4] }}</td></tr>
+        <tr><th>手配数</th><td>{{ row[5] }}</td></tr>
+        <tr><th>段取時間</th><td>{{ row[6] }}</td></tr>
+        <tr><th>加工時間</th><td>{{ row[7] }}</td></tr>
+        <tr><th>着手日時</th><td>{{ interval.start }}</td></tr>
+        <tr><th>完了日時</th><td>{{ interval.end }}</td></tr>
+        <tr><th>集計対象日（CSV）</th><td>{{ interval.clipped_date }}</td></tr>
+        <tr><th>元CSVファイル</th><td>{{ filename }}</td></tr>
+    </table>
+{% endblock %}

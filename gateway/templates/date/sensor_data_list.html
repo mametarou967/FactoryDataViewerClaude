@@ -1,0 +1,25 @@
+{% extends "date_base.html" %}
+{% block date_body %}
+    <table>
+        <thead>
+            <tr>
+                <th>時刻</th>
+                <th style="color: red;">赤 (lux)</th>
+                <th style="color: orange;">黄 (lux)</th>
+                <th style="color: green;">緑 (lux)</th>
+                <th>電流 (A)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td>{{ row.time }}</td>
+                <td>{{ row.red }}</td>
+                <td>{{ row.yellow }}</td>
+                <td>{{ row.green }}</td>
+                <td>{{ row.current }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

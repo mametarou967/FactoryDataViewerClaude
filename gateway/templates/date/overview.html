@@ -1,0 +1,91 @@
+{% extends "date_base.html" %}
+{% block title %}{{ date }} の俯瞰表示{% endblock %}
+
+{% block date_body %}
+<style>
+  .overview-grid { display: grid; grid-template-columns: 1fr 1fr 2fr; gap: 12px; }
+  .overview-row { display: contents; } /* 1行=3セル（情報・集計・グラフ） */
+  .card { border:1px solid #ddd; border-radius:8px; padding:8px; background:#fff; }
+  .card h4 { margin: 0 0 6px; font-size: 14px; color:#333; }
+  .mini { font-size: 12px; color:#666; }
+  .tight table { width:100%; border-collapse:collapse; }
+  .tight th, .tight td { border:1px solid #ddd; padding:4px 6px; white-space:nowrap; font-size:12px; }
+  .imgwrap { min-height: 120px; display:flex; align-items:center; justify-content:center; }
+  .imgwrap a { display:block; width:100%; }
+  .imgwrap img { width:100%; height:auto; display:block; }
+  .rowhead { font-weight:600; }
+  .pill { display:inline-block; padding:2px 6px; border-radius:999px; background:#f5f5f5; font-size:12px; }
+</style>
+
+<h2>{{ date }} の俯瞰表示</h2>
+<p class="mini">左から「情報」「稼働時間集計」「グラフ」。1行目は日全体、2行目以降は各品目です。</p>
+
+<div class="overview-grid">
+  {% for item in items %}
+    <div class="overview-row">
+      <!-- 1列目：情報 -->
+      <div class="card">
+        <h4>
+          {% if item.kind == 'day' %}
+            <span class="pill">日全体</span> {{ date }}
+          {% else %}
+            <span class="pill">品目 #{{ item.index }}</span>
+            {{ item.info.hinmoku_name }}
+          {% endif %}
+        </h4>
+
+        {% if item.kind == 'day' %}
+          <div class="mini">この日の全データの概要です。</div>
+        {% else %}
+          <div class="tight">
+            <table>
+              <tbody>
+                <tr><th>品目番号</th><td class="rowhead">{{ item.info.hinmoku_no }}</td></tr>
+                <tr><th>機械番号</th><td>{{ item.info.kikai_no }}</td></tr>
+                <tr><th>製番</th><td>{{ item.info.seiban }}</td></tr>
+                <tr><th>手配番号</th><td>{{ item.info.tehai_no }}</td></tr>
+                <tr><th>品目名</th><td>{{ item.info.hinmoku_name }}</td></tr>
+                <tr><th>状態</th><td>{{ item.info.status }}</td></tr>
+                <tr><th>区間</th><td>{{ item.info.intervals }}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="mini" style="margin-top:6px;">
+            <a href="/date/{{ date }}/hinmoku/{{ item.index }}">この品目のグラフ</a> ／
+            <a href="/date/{{ date }}/hinmoku/{{ item.index }}/summary">稼働時間集計</a> ／
+            <a href="/date/{{ date }}/hinmoku/{{ item.index }}/info">本日分の手配情報</a>
+          </div>
+        {% endif %}
+      </div>
+
+      <!-- 2列目：稼働時間集計 -->
+      <div class="card">
+        <h4>稼働時間集計（時間）</h4>
+        <div class="tight">
+          <table>
+            <thead><tr><th>状態</th><th>合計</th></tr></thead>
+            <tbody>
+            {% for state, hours in item.durations.items() %}
+              <tr><td>{{ state }}</td><td>{{ hours }}</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 3列目：グラフ（画像→リンク化） -->
+      <div class="card imgwrap">
+        {% if item.image_filename %}
+          {% set href = "/date/" ~ date ~ ("/graph" if item.kind == "day" else "/hinmoku/" ~ item.index) %}
+          <a href="{{ href }}" title="{% if item.kind == 'day' %}日別グラフへ{% else %}品目#{{ item.index }}のグラフへ{% endif %}">
+            <img src="/static/{{ item.image_filename }}"
+                 alt="{% if item.kind == 'day' %}日別グラフ{% else %}品目#{{ item.index }} グラフ{% endif %}">
+          </a>
+        {% else %}
+          <div class="mini">グラフなし（データなし）</div>
+        {% endif %}
+      </div>
+    </div>
+  {% endfor %}
+</div>
+{% endblock %}
