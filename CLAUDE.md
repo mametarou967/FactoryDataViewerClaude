@@ -21,7 +21,10 @@
 | DIP2 電流判定 | GPIO11 | SW5 |
 | DIP3 予備 | GPIO12 | SW5 |
 | DIP4 予備 | GPIO13 | SW5 |
-| LED1-4 | GPIO14/15/22/28 | D3/D4/D2/D1 |
+| LED ハートビート | GPIO28 | D1: 1秒周期点滅（動作確認） |
+| LED LoRa通信状態 | GPIO22 | D2: 正常通信中=点灯、タイムアウト=消灯 |
+| LED センサー異常 | GPIO14 | D3: センサーエラー時点灯 |
+| LED モード表示 | GPIO15 | D4: 設定/テストモード中点灯 |
 | SPI MISO | GPIO16 | MCP3208 |
 | SPI CS | GPIO17 | MCP3208 |
 | SPI SCK | GPIO18 | MCP3208 |
