@@ -54,25 +54,48 @@ machines:
   - name: "A214"
     patlite_addr: 0x0001
     current_addr: 0x000C
-    patlite_thresholds:       # パトライト点灯判定閾値（lux）
+    patlite_thresholds:       # パトライト点灯判定閾値（lux）。閾値以上=点灯
       red: 200
       yellow: 200
       green: 200
-    current_thresholds:       # 電流による状態判定閾値（A）
-      idle: 1.0
-      auto: 5.0
-      manual: 10.0
+    current_threshold: 3.0   # 加工中判定閾値（A）。閾値以上=加工中
   - name: "B103"
     patlite_addr: 0x0002
     current_addr: 0x000D
-    ...
+    patlite_thresholds:
+      red: 200
+      yellow: 200
+      green: 200
+    current_threshold: 3.0
 ```
 ※ 同一ユニットが両機能を兼務する場合は `patlite_addr == current_addr` を設定する
 
 ## CSVフォーマット（新設計）
 - パス: `data/sensor/<機械名>/YYYY-MM-DD.csv`
-- 列: `timestamp, red_lux, yellow_lux, green_lux, current_A`
+- 列: `HH:MM:SS, red_lux, yellow_lux, green_lux, current_A`
+  - timestamp列は時刻のみ（HH:MM:SS）。日付はファイル名から取得する
 - 記録間隔: 1分
+
+## 状態判定ロジック（GW側・機械ごとに適用）
+
+### Step1: 点灯/消灯判定
+```
+red点灯   = red_lux   >= patlite_thresholds.red
+yellow点灯 = yellow_lux >= patlite_thresholds.yellow
+green点灯  = green_lux  >= patlite_thresholds.green
+加工中     = current_A  >= current_threshold
+```
+
+### Step2: 状態判定（優先順位順）
+| 緑 | 電流 | 赤 | 黄 | 判定状態 | 表示色 |
+|----|------|----|----|---------|-------|
+| ON | any  | any | any | 自動加工中 | green |
+| OFF | 加工中 | any | any | 手動加工中 | blue |
+| OFF | 加工なし | ON | OFF | アラーム | red |
+| OFF | 加工なし | any | ON | 加工完了 | yellow |
+| OFF | 加工なし | OFF | OFF | 停止 | gray |
+
+※ 緑点灯が最優先。緑が消えている場合に電流値で自動/手動を区別する。
 
 ## 通信プロトコル（確定）
 
