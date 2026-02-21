@@ -2,6 +2,11 @@
 """
 gw_e220_config.py  –  GW側 E220 設定ツール
 
+E220-900T22S レジスタマップ（6バイト）:
+    0x00: ADDH  0x01: ADDL  0x02: REG0(SPED)
+    0x03: REG1  0x04: CHAN   0x05: REG3(OPTION)
+    ※ NETIDフィールドは存在しない
+
 事前準備:
     GW E220モジュールのDIPスイッチを M0=HIGH, M1=HIGH（コンフィグモード）にしてから実行。
     実行後は M0=LOW, M1=LOW（通常モード）に戻すこと。
@@ -9,7 +14,6 @@ gw_e220_config.py  –  GW側 E220 設定ツール
 使い方:
     python3 tools/gw_e220_config.py               # 現在設定を読み取って表示
     python3 tools/gw_e220_config.py --write       # GW設定を書き込む
-    python3 tools/gw_e220_config.py --port /dev/ttyUSB1 --write
 """
 
 import serial
@@ -18,20 +22,18 @@ import argparse
 import sys
 
 DEFAULT_PORT = "/dev/ttyUSB0"
-DEFAULT_BAUD = 9600   # E220のデフォルトボーレート（コンフィグモード時）
+DEFAULT_BAUD = 9600   # E220コンフィグモードは常に9600bps固定
 
 # ===== GWに書き込む設定値 =====
 GW_ADDH    = 0x00   # GWアドレス上位（0x0000 固定）
 GW_ADDL    = 0x00   # GWアドレス下位
-GW_NETID   = 0x00   # ネットワークID
 GW_REG0    = 0xE4   # 115200bps / 8N1 / 9.6kbps air rate
                     #   bits[7:5]=111(115200) bits[4:3]=00(8N1) bits[2:0]=100(9.6k)
 GW_REG1    = 0x00   # 200バイトパケット / RSSI無効 / 22dBm
 GW_CHANNEL = 18     # ch=18（工場1デフォルト）
-GW_REG3    = 0x40   # 固定アドレスモード
-                    #   bit6=1(fixed addressing) / それ以外0
+GW_REG3    = 0x40   # 固定アドレスモード（bit6=1）
 
-# REG0のエアレート対応表
+# 表示用マップ
 AIR_RATE_MAP = {0: "0.3k", 1: "1.2k", 2: "2.4k", 3: "4.8k",
                 4: "9.6k", 5: "19.2k", 6: "38.4k", 7: "62.5k"}
 BAUD_MAP     = {0: "1200", 1: "2400", 2: "4800", 3: "9600",
@@ -51,38 +53,35 @@ def open_port(port, baud):
 
 
 def read_config(ser):
-    """E220設定を読み取る（コンフィグモードで実行すること）"""
+    """E220設定を読み取る（コンフィグモードで実行すること）
+    コマンド: C1 00 06 → レジスタ0x00〜0x05を6バイト読み取り
+    レスポンス: [C1][00][06][ADDH][ADDL][REG0][REG1][CHAN][REG3] (9バイト)
+    """
     ser.reset_input_buffer()
 
-    # C1 00 07: レジスタ0x00〜0x06を7バイト読み取り
-    cmd = bytes([0xC1, 0x00, 0x07])
+    cmd = bytes([0xC1, 0x00, 0x06])
     ser.write(cmd)
-
     time.sleep(0.5)
-    resp = ser.read(64)  # 最大64バイト読み取り
+    resp = ser.read(64)
 
     print(f"  RAW応答: {resp.hex(' ')} ({len(resp)} bytes)")
 
-    if len(resp) < 10:
-        print(f"  [ERROR] 応答が短すぎます（期待: 10バイト以上）")
+    if len(resp) < 9:
+        print(f"  [ERROR] 応答が短すぎます（期待: 9バイト）")
         return None
-
     if resp[0] != 0xC1:
         print(f"  [ERROR] 先頭バイトが不正 (0x{resp[0]:02X}, 期待: 0xC1)")
         return None
 
-    # ヘッダ(3バイト) + データ(7バイト)
-    data = resp[3:10]
-    cfg = {
+    data = resp[3:9]  # ヘッダ3バイト後の6バイト
+    return {
         "addH":    data[0],
         "addL":    data[1],
-        "netId":   data[2],
-        "reg0":    data[3],
-        "reg1":    data[4],
-        "channel": data[5],
-        "reg3":    data[6],
+        "reg0":    data[2],
+        "reg1":    data[3],
+        "channel": data[4],
+        "reg3":    data[5],
     }
-    return cfg
 
 
 def print_config(cfg, label="設定"):
@@ -92,35 +91,34 @@ def print_config(cfg, label="設定"):
     fixed     = bool(cfg["reg3"] & 0x40)
 
     print(f"  [{label}]")
-    print(f"    アドレス    : 0x{cfg['addH']:02X}{cfg['addL']:02X}")
-    print(f"    ネットID    : 0x{cfg['netId']:02X}")
-    print(f"    UARTボーレート: {BAUD_MAP.get(baud_bits, '?')} bps")
-    print(f"    エアレート  : {AIR_RATE_MAP.get(air_bits, '?')} bps")
-    print(f"    チャンネル  : {cfg['channel']} (freq={850.125 + cfg['channel']:.3f} MHz)")
-    print(f"    TX電力      : {POWER_MAP.get(pwr_bits, '?')}")
-    print(f"    固定アドレスモード: {'有効' if fixed else '無効（透過モード）'}")
+    print(f"    アドレス          : 0x{cfg['addH']:02X}{cfg['addL']:02X}")
+    print(f"    UARTボーレート    : {BAUD_MAP.get(baud_bits, '?')} bps")
+    print(f"    エアレート        : {AIR_RATE_MAP.get(air_bits, '?')} bps")
+    print(f"    チャンネル        : {cfg['channel']} (freq={850.125 + cfg['channel']:.3f} MHz)")
+    print(f"    TX電力            : {POWER_MAP.get(pwr_bits, '?')}")
+    print(f"    固定アドレスモード: {'有効 ✓' if fixed else '無効（透過モード）'}")
     print(f"    REG0=0x{cfg['reg0']:02X} REG1=0x{cfg['reg1']:02X} REG3=0x{cfg['reg3']:02X}")
 
 
 def write_config(ser):
-    """GW設定を書き込む（コンフィグモードで実行すること）"""
+    """GW設定を書き込む（コンフィグモードで実行すること）
+    コマンド: C0 00 06 + 6バイト → E2PROMに永続書き込み
+    レスポンス: [C1][00][06][書き込んだデータ] (9バイト)
+    """
     ser.reset_input_buffer()
 
-    # C0: E2PROMに永続書き込み
     cmd = bytes([
-        0xC0, 0x00, 0x07,
-        GW_ADDH, GW_ADDL, GW_NETID,
-        GW_REG0, GW_REG1, GW_CHANNEL,
-        GW_REG3
+        0xC0, 0x00, 0x06,
+        GW_ADDH, GW_ADDL,
+        GW_REG0, GW_REG1, GW_CHANNEL, GW_REG3
     ])
     print(f"  書き込みコマンド: {cmd.hex(' ')}")
     ser.write(cmd)
-
     time.sleep(0.5)
     resp = ser.read(64)
     print(f"  RAW応答: {resp.hex(' ')} ({len(resp)} bytes)")
 
-    if len(resp) < 10 or resp[0] != 0xC1:
+    if len(resp) < 9 or resp[0] != 0xC1:
         print("  [ERROR] 書き込み応答が不正")
         return False
 
@@ -144,6 +142,8 @@ def run(port, baud, do_write):
         print_config(cfg, "現在")
     else:
         print("  読み取り失敗（M0/M1がHIGHになっているか確認してください）")
+        ser.close()
+        return
 
     if not do_write:
         ser.close()
@@ -151,8 +151,9 @@ def run(port, baud, do_write):
 
     # ---- 書き込む設定を表示 ----
     new_cfg = {
-        "addH": GW_ADDH, "addL": GW_ADDL, "netId": GW_NETID,
-        "reg0": GW_REG0, "reg1": GW_REG1, "channel": GW_CHANNEL, "reg3": GW_REG3
+        "addH": GW_ADDH, "addL": GW_ADDL,
+        "reg0": GW_REG0, "reg1": GW_REG1,
+        "channel": GW_CHANNEL, "reg3": GW_REG3
     }
     print("\n[2] 書き込む設定:")
     print_config(new_cfg, "書き込み予定")

@@ -51,9 +51,10 @@ static const uint32_t LORA_COMMS_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 
 // ===== このユニットに書き込みたい E220 設定値 =====
 // ユニットごとに DESIRED_ADDH/ADDL を変更すること（0xMMTT形式）
+// E220-900T22S レジスタマップ（NETIDなし）:
+//   0x00:ADDH  0x01:ADDL  0x02:REG0(SPED)  0x03:REG1  0x04:CHAN  0x05:REG3(OPTION)
 static const uint8_t DESIRED_ADDH    = 0x01;   // machine=1
 static const uint8_t DESIRED_ADDL    = 0x01;   // type=patlite
-static const uint8_t DESIRED_NETID   = 0x00;
 static const uint8_t DESIRED_REG0    = 0xE4;   // 115200bps / 8N1 / 9.6kbps air
                                                 //  bits[7:5]=111(115200) [4:3]=00(8N1) [2:0]=100(9.6k)
 static const uint8_t DESIRED_REG1    = 0x00;   // 200バイト / RSSI無効 / 22dBm
@@ -61,18 +62,18 @@ static const uint8_t DESIRED_CHANNEL = 18;     // LoRaチャンネル
 static const uint8_t DESIRED_REG3    = 0x40;   // 固定アドレスモード（bit6=1）
 
 // ===== E220設定構造体 =====
+// NETIDフィールドは存在しない（E220-900T22Sの実レジスタマップに準拠）
 struct E220Config {
-    uint8_t addH;     // ADDH
-    uint8_t addL;     // ADDL
-    uint8_t netId;    // NETID
-    uint8_t reg0;     // UART baud / parity / air rate
-    uint8_t reg1;     // packet size / noise / TX power
-    uint8_t channel;  // LoRaチャンネル
-    uint8_t reg3;     // 固定アドレス / RSSI / LBT / WOR
+    uint8_t addH;     // ADDH (0x00)
+    uint8_t addL;     // ADDL (0x01)
+    uint8_t reg0;     // REG0: UART baud / parity / air rate (0x02)
+    uint8_t reg1;     // REG1: packet size / noise / TX power (0x03)
+    uint8_t channel;  // CHAN: LoRaチャンネル (0x04)
+    uint8_t reg3;     // REG3: 固定アドレス / RSSI / LBT / WOR (0x05)
 };
 
 static E220Config g_e220 = {
-    DESIRED_ADDH, DESIRED_ADDL, DESIRED_NETID,
+    DESIRED_ADDH, DESIRED_ADDL,
     DESIRED_REG0, DESIRED_REG1, DESIRED_CHANNEL, DESIRED_REG3
 };
 
@@ -125,12 +126,14 @@ static bool e220ReadConfig(E220Config &cfg) {
     serial2Begin(9600);
     while (Serial2.available()) Serial2.read();
 
-    uint8_t cmd[3] = {0xC1, 0x00, 0x07};
+    // C1 00 06: レジスタ0x00〜0x05を6バイト読み取り
+    // レスポンス: [C1][00][06][ADDH][ADDL][REG0][REG1][CHAN][REG3] (9バイト)
+    uint8_t cmd[3] = {0xC1, 0x00, 0x06};
     Serial2.write(cmd, sizeof(cmd));
     Serial2.flush();
 
     uint32_t t = millis();
-    while (Serial2.available() < 10) {
+    while (Serial2.available() < 9) {
         if (millis() - t > 500) {
             serial2Begin(115200);
             e220SetNormalMode();
@@ -139,8 +142,8 @@ static bool e220ReadConfig(E220Config &cfg) {
         delay(1);
     }
 
-    uint8_t buf[10];
-    for (int i = 0; i < 10; i++) buf[i] = Serial2.read();
+    uint8_t buf[9];
+    for (int i = 0; i < 9; i++) buf[i] = Serial2.read();
 
     serial2Begin(115200);
     e220SetNormalMode();
@@ -150,11 +153,10 @@ static bool e220ReadConfig(E220Config &cfg) {
 
     cfg.addH    = buf[3];
     cfg.addL    = buf[4];
-    cfg.netId   = buf[5];
-    cfg.reg0    = buf[6];
-    cfg.reg1    = buf[7];
-    cfg.channel = buf[8];
-    cfg.reg3    = buf[9];
+    cfg.reg0    = buf[5];
+    cfg.reg1    = buf[6];
+    cfg.channel = buf[7];
+    cfg.reg3    = buf[8];
     return true;
 }
 
@@ -168,17 +170,18 @@ static bool e220WriteConfig(const E220Config &cfg) {
     serial2Begin(9600);
     while (Serial2.available()) Serial2.read();
 
-    uint8_t cmd[10] = {
-        0xC0, 0x00, 0x07,
-        cfg.addH, cfg.addL, cfg.netId,
-        cfg.reg0, cfg.reg1, cfg.channel,
-        cfg.reg3
+    // C0 00 06: レジスタ0x00〜0x05に6バイト書き込み（E2PROM永続）
+    // レスポンス: [C1][00][06][書き込んだデータ] (9バイト)
+    uint8_t cmd[9] = {
+        0xC0, 0x00, 0x06,
+        cfg.addH, cfg.addL,
+        cfg.reg0, cfg.reg1, cfg.channel, cfg.reg3
     };
     Serial2.write(cmd, sizeof(cmd));
     Serial2.flush();
 
     uint32_t t = millis();
-    while (Serial2.available() < 10) {
+    while (Serial2.available() < 9) {
         if (millis() - t > 500) {
             serial2Begin(115200);
             e220SetNormalMode();
@@ -187,8 +190,8 @@ static bool e220WriteConfig(const E220Config &cfg) {
         delay(1);
     }
 
-    uint8_t buf[10];
-    for (int i = 0; i < 10; i++) buf[i] = Serial2.read();
+    uint8_t buf[9];
+    for (int i = 0; i < 9; i++) buf[i] = Serial2.read();
 
     serial2Begin(115200);
     e220SetNormalMode();
@@ -320,7 +323,7 @@ static void e220ConfigureIfNeeded() {
 
     // 設定書き込み
     E220Config desired = {
-        DESIRED_ADDH, DESIRED_ADDL, DESIRED_NETID,
+        DESIRED_ADDH, DESIRED_ADDL,
         DESIRED_REG0, DESIRED_REG1, DESIRED_CHANNEL, DESIRED_REG3
     };
     if (e220WriteConfig(desired)) {
