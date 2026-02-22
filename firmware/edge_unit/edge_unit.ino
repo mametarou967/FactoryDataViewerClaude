@@ -200,12 +200,37 @@ static bool e220WriteConfig(const E220Config &cfg) {
     return (buf[0] == 0xC1);
 }
 
+// ===== 生データ HEX ダンプ =====
+static void hexDump(const char *label, const uint8_t *data, int len) {
+    Serial.printf("%s (%d bytes):", label, len);
+    for (int i = 0; i < len; i++) Serial.printf(" %02X", data[i]);
+    Serial.println();
+}
+
 // ===== GWへのレスポンス送信 =====
 static void sendToGW(const uint8_t *payload, uint8_t len) {
     uint8_t header[3] = {0x00, 0x00, g_e220.channel};
+    uint8_t full[35];
+    memcpy(full, header, 3);
+    memcpy(full + 3, payload, len);
+    hexDump("[TX]", full, 3 + len);
     Serial2.write(header, sizeof(header));
     Serial2.write(payload, len);
     Serial2.flush();
+
+    // AUX監視: E220がTXを受け付けるとAUXがLOWになるはず
+    uint32_t t = millis();
+    bool auxWentLow = false;
+    while (millis() - t < 200) {
+        if (digitalRead(PIN_LORA_AUX) == LOW) { auxWentLow = true; break; }
+    }
+    if (auxWentLow) {
+        uint32_t lowDur = millis();
+        while (digitalRead(PIN_LORA_AUX) == LOW && millis() - lowDur < 2000);
+        Serial.printf("[TX] AUX LOW->HIGH (TX done, %lu ms)\n", millis() - lowDur);
+    } else {
+        Serial.println("[TX] AUX stayed HIGH (E220 did NOT accept TX data!)");
+    }
 }
 
 static void onRxSuccess() {
@@ -282,8 +307,9 @@ static void processCommand() {
 
     if (len < 3) return;
 
+    hexDump("[RX]", buf, len);
     uint8_t cmd = buf[0];
-    Serial.printf("[RX] cmd='%c' (%d bytes)\n", (char)cmd, len);
+    Serial.printf("[RX] cmd='%c'\n", (char)cmd);
 
     switch (cmd) {
         case 'K': cmdPing();               break;
@@ -295,6 +321,43 @@ static void processCommand() {
     }
 }
 
+// ===== E220 設定詳細ダンプ =====
+static void e220PrintConfig(const E220Config &cfg, const char *label) {
+    static const char *BAUD_STR[]  = {"1200","2400","4800","9600","19200","38400","57600","115200"};
+    static const char *PAR_STR[]   = {"8N1","8O1","8E1","8N1"};
+    static const char *AIR_STR[]   = {"0.3k","1.2k","2.4k","4.8k","9.6k","19.2k","38.4k","62.5k"};
+    static const char *PKT_STR[]   = {"200","128","64","32"};
+    static const char *PWR_STR[]   = {"22dBm","17dBm","13dBm","10dBm"};
+    static const char *WOR_STR[]   = {"500","1000","1500","2000","2500","3000","3500","4000"};
+
+    uint8_t raw[6] = {cfg.addH, cfg.addL, cfg.reg0, cfg.reg1, cfg.channel, cfg.reg3};
+    hexDump(label, raw, 6);
+
+    uint8_t baudBits   = (cfg.reg0 >> 5) & 0x07;
+    uint8_t parBits    = (cfg.reg0 >> 3) & 0x03;
+    uint8_t airBits    =  cfg.reg0       & 0x07;
+    uint8_t pktBits    = (cfg.reg1 >> 6) & 0x03;
+    bool    rssiNoise  = (cfg.reg1 >> 5) & 0x01;
+    uint8_t pwrBits    =  cfg.reg1       & 0x03;
+    bool    rssiAppend = (cfg.reg3 >> 7) & 0x01;
+    bool    fixedMode  = (cfg.reg3 >> 6) & 0x01;
+    bool    lbt        = (cfg.reg3 >> 5) & 0x01;
+    uint8_t worBits    = (cfg.reg3 >> 1) & 0x07;
+
+    Serial.printf("  Addr        : 0x%02X%02X\n", cfg.addH, cfg.addL);
+    Serial.printf("  Channel     : %d (%.3f MHz)\n", cfg.channel, 850.125f + cfg.channel);
+    Serial.printf("  UART baud   : %s bps  [REG0 b7:5=%d]\n", BAUD_STR[baudBits], baudBits);
+    Serial.printf("  UART parity : %s      [REG0 b4:3=%d]\n", PAR_STR[parBits],   parBits);
+    Serial.printf("  Air rate    : %s bps  [REG0 b2:0=%d]\n", AIR_STR[airBits],   airBits);
+    Serial.printf("  Pkt size    : %s B    [REG1 b7:6=%d]\n", PKT_STR[pktBits],   pktBits);
+    Serial.printf("  RSSI noise  : %s      [REG1 b5]\n",   rssiNoise  ? "ENABLED" : "disabled");
+    Serial.printf("  TX power    : %s      [REG1 b1:0=%d]\n", PWR_STR[pwrBits],   pwrBits);
+    Serial.printf("  RSSI append : %s      [REG3 b7]\n",   rssiAppend ? "ENABLED" : "disabled");
+    Serial.printf("  Fixed addr  : %s      [REG3 b6]\n",   fixedMode  ? "ENABLED" : "disabled(transparent)");
+    Serial.printf("  LBT         : %s      [REG3 b5]\n",   lbt        ? "ENABLED" : "disabled");
+    Serial.printf("  WOR period  : %s ms   [REG3 b3:1=%d]\n", WOR_STR[worBits],   worBits);
+}
+
 // ===== E220 設定チェック・自動書き込み =====
 static void e220ConfigureIfNeeded() {
     Serial.println("Reading E220 config (9600bps config mode)...");
@@ -302,8 +365,7 @@ static void e220ConfigureIfNeeded() {
     bool readOk = e220ReadConfig(current);
 
     if (readOk) {
-        Serial.printf("  Read OK: ADDR=0x%02X%02X  CH=%d  REG0=0x%02X  REG3=0x%02X\n",
-            current.addH, current.addL, current.channel, current.reg0, current.reg3);
+        e220PrintConfig(current, "[E220 current]");
 
         bool match = (current.addH    == DESIRED_ADDH    &&
                       current.addL    == DESIRED_ADDL    &&
@@ -328,8 +390,7 @@ static void e220ConfigureIfNeeded() {
     };
     if (e220WriteConfig(desired)) {
         g_e220 = desired;
-        Serial.printf("  Write OK: ADDR=0x%02X%02X  CH=%d\n",
-            g_e220.addH, g_e220.addL, g_e220.channel);
+        e220PrintConfig(g_e220, "[E220 after write]");
     } else {
         Serial.println("  Write FAILED. Using desired values as-is.");
         g_e220 = desired;
@@ -415,6 +476,7 @@ void loop() {
         digitalWrite(PIN_LED_D2, LOW);
         Serial.println("[D2] LoRa comms timeout -> D2 OFF");
     }
+
 }
 
 // ===== Core1 (Step3で実装予定) =====

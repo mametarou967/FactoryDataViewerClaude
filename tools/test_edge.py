@@ -25,8 +25,8 @@ DEFAULT_BAUD    = 115200
 DEFAULT_ADDR    = 0x0101  # エッジのLoRaアドレス（0xMMTT形式）
 DEFAULT_CHANNEL = 18      # LoRaチャンネル
 
-TIMEOUT_MS  = 500  # 応答タイムアウト [ms]
-RETRY_COUNT = 1    # 再送回数
+TIMEOUT_MS  = 3000   # 応答タイムアウト [ms]  ※9.6kbpsではRT~1100msのため余裕を持って設定
+RETRY_COUNT = 0     # 再送なし（再送するとLoRa TX同士が衝突する）
 
 # ===== エラーコード =====
 ERROR_CODES = {
@@ -34,6 +34,11 @@ ERROR_CODES = {
     0x02: "未対応コマンド",
     0x03: "処理タイムアウト",
 }
+
+
+def hex_dump(label, data):
+    body = ' '.join(f'{b:02X}' for b in data)
+    print(f"  {label} ({len(data)} bytes): {body}")
 
 
 def send_command(ser, edge_addr, channel, cmd_char, timeout_ms=TIMEOUT_MS, retries=RETRY_COUNT):
@@ -53,6 +58,7 @@ def send_command(ser, edge_addr, channel, cmd_char, timeout_ms=TIMEOUT_MS, retri
 
         ser.reset_input_buffer()
         ser.write(packet)
+        hex_dump("TX", packet)
 
         # CRLFで終端されるまで読み取る
         deadline = time.time() + timeout_ms / 1000.0
@@ -61,8 +67,14 @@ def send_command(ser, edge_addr, channel, cmd_char, timeout_ms=TIMEOUT_MS, retri
             if ser.in_waiting:
                 buf += ser.read(ser.in_waiting)
                 if len(buf) >= 3 and buf[-2] == 0x0D and buf[-1] == 0x0A:
+                    hex_dump("RX", buf)
                     return bytes(buf)
             time.sleep(0.005)
+
+        if buf:
+            hex_dump("RX(partial)", buf)
+        else:
+            print(f"  RX: 0 bytes (timeout)")
 
     return None  # タイムアウト
 
