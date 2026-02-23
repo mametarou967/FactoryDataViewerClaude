@@ -1,16 +1,16 @@
 /**
- * edge_unit.ino  –  Phase 2 Step1: E220基本通信
+ * edge_unit.ino  –  Phase 2 Step2: ポーリング応答（ダミーデータ）
  *
  * 実装内容:
  *   - E220ドライバ（モード切替・設定読み取り・設定書き込み）
  *   - AUX割り込みによるコマンド受信基盤
  *   - 起動時 AUX=HIGH 待ち（E220初期化完了確認後に割り込み有効化）
  *   - K(Ping) / V(Version) / H(HW情報) / E(Error) 応答
+ *   - P(Patlite) / C(Current) ダミーデータ応答
  *   - 初回起動時 E220 自動設定（DESIRED_* 定数に基づく）
  *
  * 未実装（後続Step）:
- *   - P/C センサー応答（Step2）
- *   - デュアルコア センサーサンプリング（Step3）
+ *   - デュアルコア センサーサンプリング（Step3: ダミー→実センサーに置換）
  *   - 設定UI・E220設定変更（Step4）
  *   - ローカルテストモード（Step5）
  *
@@ -286,6 +286,36 @@ static void cmdHwInfo() {
         dip, g_e220.addH, g_e220.addL, g_e220.channel, airRate, txPower);
 }
 
+static void cmdPatlite() {
+    // Step2: ダミー値。Step3でCore1の共有データに置換する
+    uint16_t red_lux = 300;   // ダミー: 赤点灯相当
+    uint16_t yel_lux = 0;     // ダミー: 黄消灯
+    uint16_t grn_lux = 500;   // ダミー: 緑点灯相当
+    uint8_t resp[] = {
+        g_e220.addH, g_e220.addL, 'P',
+        (uint8_t)(red_lux >> 8), (uint8_t)(red_lux & 0xFF),
+        (uint8_t)(yel_lux >> 8), (uint8_t)(yel_lux & 0xFF),
+        (uint8_t)(grn_lux >> 8), (uint8_t)(grn_lux & 0xFF),
+        '\r', '\n'
+    };
+    sendToGW(resp, sizeof(resp));
+    onRxSuccess();
+    Serial.printf("[P] Patlite dummy: red=%d yel=%d grn=%d\n", red_lux, yel_lux, grn_lux);
+}
+
+static void cmdCurrent() {
+    // Step2: ダミー値。Step3でCore1の共有データに置換する
+    uint16_t current_raw = 1234;  // ダミー: 12.34A
+    uint8_t resp[] = {
+        g_e220.addH, g_e220.addL, 'C',
+        (uint8_t)(current_raw >> 8), (uint8_t)(current_raw & 0xFF),
+        '\r', '\n'
+    };
+    sendToGW(resp, sizeof(resp));
+    onRxSuccess();
+    Serial.printf("[C] Current dummy: %d (%.2fA)\n", current_raw, current_raw / 100.0f);
+}
+
 static void cmdError(uint8_t code) {
     uint8_t resp[] = {g_e220.addH, g_e220.addL, 'E', code, '\r', '\n'};
     sendToGW(resp, sizeof(resp));
@@ -317,8 +347,8 @@ static void processCommand() {
         case 'K': cmdPing();               break;
         case 'V': cmdVersion();            break;
         case 'H': cmdHwInfo();             break;
-        case 'P': cmdError(ERR_UNKNOWN_CMD); break;  // Step2で実装
-        case 'C': cmdError(ERR_UNKNOWN_CMD); break;  // Step2で実装
+        case 'P': cmdPatlite(); break;
+        case 'C': cmdCurrent(); break;
         default:  cmdError(ERR_UNKNOWN_CMD); break;
     }
 }

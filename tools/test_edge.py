@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_edge.py  –  Phase 2 Step1 エッジユニット テストスクリプト
+test_edge.py  –  Phase 2 Step2 エッジユニット テストスクリプト
 
 Ubuntu PC + USB E220（GW役）からコマンドを送信し、応答を確認する。
 
@@ -131,6 +131,17 @@ def parse_response(resp, cmd_char):
             result["air_rate"]     = data[4]
             result["tx_power"]     = data[5]
 
+    elif cmd_char == 'P':
+        if len(data) >= 6:
+            result["red_lux"] = (data[0] << 8) | data[1]
+            result["yel_lux"] = (data[2] << 8) | data[3]
+            result["grn_lux"] = (data[4] << 8) | data[5]
+
+    elif cmd_char == 'C':
+        if len(data) >= 2:
+            raw = (data[0] << 8) | data[1]
+            result["current_A"] = raw / 100.0
+
     return result
 
 
@@ -151,7 +162,7 @@ def run_test(port, baud, edge_addr, channel):
 
     results = {}
 
-    for cmd in ['K', 'V', 'H']:
+    for cmd in ['K', 'V', 'H', 'P', 'C']:
         print(f"[{cmd}] ", end="", flush=True)
         resp   = send_command(ser, edge_addr, channel, cmd)
         parsed = parse_response(resp, cmd)
@@ -184,6 +195,14 @@ def run_test(port, baud, edge_addr, channel):
                 print(f"     E220 ch   : {parsed['e220_ch']}")
                 print(f"     air_rate  : {parsed['air_rate']}")
                 print(f"     tx_power  : {parsed['tx_power']}")
+            elif cmd == 'P':
+                print(f"OK  from={parsed['from_addr']}")
+                print(f"     red   : {parsed.get('red_lux', '?')} lux")
+                print(f"     yellow: {parsed.get('yel_lux', '?')} lux")
+                print(f"     green : {parsed.get('grn_lux', '?')} lux")
+            elif cmd == 'C':
+                print(f"OK  from={parsed['from_addr']}")
+                print(f"     current: {parsed.get('current_A', '?'):.2f} A")
             print(f"     raw: {parsed['raw']}")
 
         time.sleep(0.3)
