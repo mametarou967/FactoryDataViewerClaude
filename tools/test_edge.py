@@ -7,7 +7,7 @@ Ubuntu PC + USB E220（GW役）からコマンドを送信し、応答を確認�
 使い方:
     python3 test_edge.py                          # デフォルト設定で実行
     python3 test_edge.py --port /dev/ttyUSB1      # ポート指定
-    python3 test_edge.py --addr 0x0201 --ch 19    # アドレス・チャンネル指定
+    python3 test_edge.py --addr 0x0201 --ch 3     # アドレス・チャンネル指定
 
 事前準備:
     pip install pyserial
@@ -23,9 +23,9 @@ import sys
 DEFAULT_PORT    = "/dev/ttyUSB0"
 DEFAULT_BAUD    = 9600
 DEFAULT_ADDR    = 0x0101  # エッジのLoRaアドレス（0xMMTT形式）
-DEFAULT_CHANNEL = 18      # LoRaチャンネル
+DEFAULT_CHANNEL = 2       # LoRaチャンネル (JP版 CH2=921.0MHz, Zone A)
 
-TIMEOUT_MS  = 3000   # 応答タイムアウト [ms]  ※9.6kbpsではRT~1100msのため余裕を持って設定
+TIMEOUT_MS  = 2500   # 応答タイムアウト [ms]  ※9375bps(SF6/BW125k)でRT~1100ms+100ms待機→2500msで22台×全タイムアウト=55秒以内
 RETRY_COUNT = 0     # 再送なし（再送するとLoRa TX同士が衝突する）
 
 # ===== エラーコード =====
