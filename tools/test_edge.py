@@ -206,8 +206,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Edge unit test via E220 LoRa")
     parser.add_argument("--port", default=DEFAULT_PORT,        help="シリアルポート (default: /dev/ttyUSB0)")
     parser.add_argument("--addr", default=hex(DEFAULT_ADDR),   help="エッジアドレス (default: 0x0101)")
-    parser.add_argument("--ch",   default=DEFAULT_CHANNEL, type=int, help="LoRaチャンネル (default: 18)")
-    parser.add_argument("--baud", default=DEFAULT_BAUD,    type=int, help="ボーレート (default: 115200)")
+    parser.add_argument("--ch",   default=DEFAULT_CHANNEL, type=int, help="LoRaチャンネル (default: 2)")
+    parser.add_argument("--baud", default=DEFAULT_BAUD,    type=int, help="ボーレート (default: 9600)")
     args = parser.parse_args()
 
     run_test(
