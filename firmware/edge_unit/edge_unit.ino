@@ -67,10 +67,10 @@ static const uint8_t DESIRED_REG3    = 0x40;   // 固定アドレスモード（
 struct E220Config {
     uint8_t addH;     // ADDH (0x00)
     uint8_t addL;     // ADDL (0x01)
-    uint8_t reg0;     // REG0: UART baud / parity / air rate (0x02)
+    uint8_t reg0;     // REG0: UART baud / air rate (0x02)  ※JP版: パリティフィールドなし
     uint8_t reg1;     // REG1: packet size / noise / TX power (0x03)
     uint8_t channel;  // CHAN: LoRaチャンネル (0x04)
-    uint8_t reg3;     // REG3: 固定アドレス / RSSI / LBT / WOR (0x05)
+    uint8_t reg3;     // REG3: 固定アドレス / RSSI / TX電力テーブル(22Lのみ) / WOR (0x05)
 };
 
 static E220Config g_e220 = {
