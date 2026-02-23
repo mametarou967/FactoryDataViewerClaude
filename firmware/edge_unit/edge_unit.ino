@@ -118,8 +118,8 @@ static void e220SetConfigMode() {
 
 // ===== E220 設定読み取り =====
 // E220コンフィグモードのUARTは 9600bps 固定。
-// レジスタ 0x00〜0x06 の 7バイトを読み取る。
-// レスポンス: [C1][00][07][ADDH][ADDL][NETID][REG0][REG1][CHAN][REG3] (10バイト)
+// レジスタ 0x00〜0x05 の 6バイトを読み取る。
+// レスポンス: [C1][00][06][ADDH][ADDL][REG0][REG1][CHAN][REG3] (9バイト)  ※NETIDなし
 static bool e220ReadConfig(E220Config &cfg) {
     e220SetConfigMode();
     delay(100);
@@ -163,7 +163,7 @@ static bool e220ReadConfig(E220Config &cfg) {
 
 // ===== E220 設定書き込み =====
 // C0コマンド: E2PROMに永続書き込み。
-// レスポンス: [C1][00][07][書き込んだデータ] (10バイト)
+// レスポンス: [C1][00][06][書き込んだデータ] (9バイト)  ※NETIDなし
 static bool e220WriteConfig(const E220Config &cfg) {
     e220SetConfigMode();
     delay(100);
@@ -184,7 +184,7 @@ static bool e220WriteConfig(const E220Config &cfg) {
     uint32_t t = millis();
     while (Serial2.available() < 9) {
         if (millis() - t > 500) {
-            serial2Begin(115200);
+            serial2Begin(9600);
             e220SetNormalMode();
             return false;
         }
