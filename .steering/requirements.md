@@ -6,7 +6,7 @@
 ## エッジユニット要件
 
 ### ハードウェア
-- Raspberry Pi Pico (RP2040) + E220-900T22S (LoRa)
+- Raspberry Pi Pico (RP2040) + E220-900T22S(JP) (LoRa、日本版)
 - SSD1306 OLED 128×64px（I2C1: GPIO26/27）
 - LED × 4個（パネル引き出し、前面から視認可能）
   - D1(GPIO28): ハートビート（1秒周期点滅、Core0+Core1の両方が生きているときのみ点滅）
@@ -43,7 +43,7 @@
 ## ゲートウェイ要件
 
 ### ハードウェア
-- Raspberry Pi 5 + USB接続 E220-900T22S
+- Raspberry Pi 5 + USB接続 E220-900T22S(JP)
 
 ### 機能要件
 - 22ユニット全台を1分以内にポーリング完了

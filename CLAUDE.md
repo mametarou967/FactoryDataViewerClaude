@@ -57,12 +57,13 @@
 ```
 firmware/
   sandbox/        # 既存センサーコード（参照用）
-  edge_unit/      # メインスケッチ（実装予定）
+  edge_unit/      # メインスケッチ（実装中）
 gateway/
   app.py          # Flask統合アプリ（LoRaポーリング + Web UI + メンテ画面）（再実装予定）
   server_file_copy.py  # SMBファイル同期（cron独立実行）
   lora_logger.py  # プロトタイプ版（参照用・廃止予定）
 hardware/         # KiCadスケマティック
 docs/             # データシート等（E220 JP版など）
+tools/            # 開発・設定・テスト用スクリプト（gw_e220_config.py, test_edge.py）
 .steering/        # 仕様・設計・タスク管理
 ```
