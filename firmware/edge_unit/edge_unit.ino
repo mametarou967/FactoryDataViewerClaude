@@ -15,7 +15,7 @@
  *   - ローカルテストモード（Step5）
  *
  * E220 コンフィグモード(M0=HIGH,M1=HIGH)では UART は常に 9600bps 固定。
- * 通常動作モードでは DESIRED_REG0 に設定したボーレート（115200bps）を使用する。
+ * 通常動作モードでは DESIRED_REG0 に設定したボーレート（9600bps）を使用する。
  */
 
 // ===== Pin Assignment (CLAUDE.md 準拠) =====
@@ -55,10 +55,11 @@ static const uint32_t LORA_COMMS_TIMEOUT_MS = 5UL * 60UL * 1000UL;
 //   0x00:ADDH  0x01:ADDL  0x02:REG0(SPED)  0x03:REG1  0x04:CHAN  0x05:REG3(OPTION)
 static const uint8_t DESIRED_ADDH    = 0x01;   // machine=1
 static const uint8_t DESIRED_ADDL    = 0x01;   // type=patlite
-static const uint8_t DESIRED_REG0    = 0xE4;   // 115200bps / 8N1 / 9.6kbps air
-                                                //  bits[7:5]=111(115200) [4:3]=00(8N1) [2:0]=100(9.6k)
-static const uint8_t DESIRED_REG1    = 0x00;   // 200バイト / RSSI無効 / 22dBm
-static const uint8_t DESIRED_CHANNEL = 18;     // LoRaチャンネル
+static const uint8_t DESIRED_REG0    = 0x64;   // 9600bps UART / 9375bps air (SF6/BW125kHz)
+                                                //  bits[7:5]=011(9600bps) bits[4:0]=00100(SF6/BW125k)
+static const uint8_t DESIRED_REG1    = 0x01;   // 200バイト / RSSI無効 / 13dBm(22S JPデフォルト)
+                                                //  bits[7:6]=00(200B) bit5=0(RSSI無効) bits[3:0]=0001(13dBm)
+static const uint8_t DESIRED_CHANNEL = 2;      // LoRaチャンネル (JP版: BW125kHz→921.0MHz, BW500kHz→921.2MHz, Zone A)
 static const uint8_t DESIRED_REG3    = 0x40;   // 固定アドレスモード（bit6=1）
 
 // ===== E220設定構造体 =====
@@ -135,7 +136,7 @@ static bool e220ReadConfig(E220Config &cfg) {
     uint32_t t = millis();
     while (Serial2.available() < 9) {
         if (millis() - t > 500) {
-            serial2Begin(115200);
+            serial2Begin(9600);
             e220SetNormalMode();
             return false;
         }
@@ -145,7 +146,7 @@ static bool e220ReadConfig(E220Config &cfg) {
     uint8_t buf[9];
     for (int i = 0; i < 9; i++) buf[i] = Serial2.read();
 
-    serial2Begin(115200);
+    serial2Begin(9600);
     e220SetNormalMode();
     delay(20);
 
@@ -193,7 +194,7 @@ static bool e220WriteConfig(const E220Config &cfg) {
     uint8_t buf[9];
     for (int i = 0; i < 9; i++) buf[i] = Serial2.read();
 
-    serial2Begin(115200);
+    serial2Begin(9600);
     e220SetNormalMode();
     delay(100);  // E2PROM書き込み完了待ち
 
@@ -214,6 +215,7 @@ static void sendToGW(const uint8_t *payload, uint8_t len) {
     memcpy(full, header, 3);
     memcpy(full + 3, payload, len);
     hexDump("[TX]", full, 3 + len);
+    delay(100);  // GW E220のRX切替完了を待つ（即時応答問題対策）
     Serial2.write(header, sizeof(header));
     Serial2.write(payload, len);
     Serial2.flush();
@@ -266,8 +268,8 @@ static void cmdHwInfo() {
     if (digitalRead(PIN_DIP3) == LOW) dip |= 0x04;
     if (digitalRead(PIN_DIP4) == LOW) dip |= 0x08;
 
-    uint8_t airRate = g_e220.reg0 & 0x07;
-    uint8_t txPower = g_e220.reg1 & 0x03;
+    uint8_t airRate = g_e220.reg0 & 0x1F;  // JP版: bits[4:0] (SF/BW複合5ビット)
+    uint8_t txPower = g_e220.reg1 & 0x0F;  // JP版 22S: bits[3:0]
 
     uint8_t resp[] = {
         g_e220.addH, g_e220.addL, 'H',
@@ -321,41 +323,57 @@ static void processCommand() {
     }
 }
 
-// ===== E220 設定詳細ダンプ =====
+// ===== E220 設定詳細ダンプ (JP版: E220-900T22S/22L(JP) firmware v2.0準拠) =====
+// REG0: bits[7:5]=UARTボーレート, bits[4:0]=エアレート(SF/BW複合)  ※パリティフィールドなし
+// REG1: bits[7:6]=パケットサイズ, bit5=RSSIノイズ, bit4=Reserved, bits[3:0]=TX電力(22S: 最大13dBm)
+// REG3: bit7=RSSI付与, bit6=送信モード(1=通常/固定アドレス), bit5=TX電力テーブル(22Lのみ), bits[2:0]=WOR
 static void e220PrintConfig(const E220Config &cfg, const char *label) {
-    static const char *BAUD_STR[]  = {"1200","2400","4800","9600","19200","38400","57600","115200"};
-    static const char *PAR_STR[]   = {"8N1","8O1","8E1","8N1"};
-    static const char *AIR_STR[]   = {"0.3k","1.2k","2.4k","4.8k","9.6k","19.2k","38.4k","62.5k"};
-    static const char *PKT_STR[]   = {"200","128","64","32"};
-    static const char *PWR_STR[]   = {"22dBm","17dBm","13dBm","10dBm"};
-    static const char *WOR_STR[]   = {"500","1000","1500","2000","2500","3000","3500","4000"};
+    static const char *BAUD_STR[] = {"1200","2400","4800","9600","19200","38400","57600","115200"};
+    static const char *PKT_STR[]  = {"200","128","64","32"};
+    static const char *BW_STR[]   = {"BW125k","BW250k","BW500k","??"};
+    static const char *WOR_STR[]  = {"500","1000","1500","2000","2500","3000","??","??"};
+    // JP版 22S TX電力: bits[3:0]=0→未定義, 1→13dBm(default), 2→7dBm, 3→0dBm, 4-15→1-12dBm
+    static const int8_t PWR_DBM[] = {-99,13,7,0,1,2,3,4,5,6,7,8,9,10,11,12};
+    // JP版 BW開始周波数
+    static const float  BW_BASE[] = {920.6f, 920.7f, 920.8f};
 
     uint8_t raw[6] = {cfg.addH, cfg.addL, cfg.reg0, cfg.reg1, cfg.channel, cfg.reg3};
     hexDump(label, raw, 6);
 
-    uint8_t baudBits   = (cfg.reg0 >> 5) & 0x07;
-    uint8_t parBits    = (cfg.reg0 >> 3) & 0x03;
-    uint8_t airBits    =  cfg.reg0       & 0x07;
-    uint8_t pktBits    = (cfg.reg1 >> 6) & 0x03;
-    bool    rssiNoise  = (cfg.reg1 >> 5) & 0x01;
-    uint8_t pwrBits    =  cfg.reg1       & 0x03;
-    bool    rssiAppend = (cfg.reg3 >> 7) & 0x01;
-    bool    fixedMode  = (cfg.reg3 >> 6) & 0x01;
-    bool    lbt        = (cfg.reg3 >> 5) & 0x01;
-    uint8_t worBits    = (cfg.reg3 >> 1) & 0x07;
+    uint8_t baudBits  = (cfg.reg0 >> 5) & 0x07;
+    uint8_t airBits   =  cfg.reg0 & 0x1F;            // JP版: bits[4:0] = SF/BW複合
+    uint8_t bwIdx     =  airBits & 0x03;              // bits[1:0]: 0=BW125k, 1=BW250k, 2=BW500k
+    uint8_t sf        = ((airBits >> 2) & 0x07) + 5; // bits[4:2]+5 = SF5〜SF11
+    uint8_t pktBits   = (cfg.reg1 >> 6) & 0x03;
+    bool    rssiNoise = (cfg.reg1 >> 5) & 0x01;
+    uint8_t pwrBits   =  cfg.reg1 & 0x0F;            // JP版 22S: bits[3:0]
+    bool    rssiApp   = (cfg.reg3 >> 7) & 0x01;
+    bool    fixedMode = (cfg.reg3 >> 6) & 0x01;
+    bool    txTblB    = (cfg.reg3 >> 5) & 0x01;      // JP版 22L送信出力テーブル選択
+    uint8_t worBits   =  cfg.reg3 & 0x07;            // JP版: bits[2:0]
+
+    // エアレート計算: Rb = SF * (BW / 2^SF) * 4/5
+    static const uint32_t BW_HZ[] = {125000, 250000, 500000, 0};
+    float rb = (bwIdx < 3 && sf >= 5 && sf <= 12)
+               ? (float)sf * BW_HZ[bwIdx] / (1UL << sf) * 0.8f : 0;
+    float freq = (bwIdx < 3) ? BW_BASE[bwIdx] + cfg.channel * 0.2f : 0;
 
     Serial.printf("  Addr        : 0x%02X%02X\n", cfg.addH, cfg.addL);
-    Serial.printf("  Channel     : %d (%.3f MHz)\n", cfg.channel, 850.125f + cfg.channel);
+    Serial.printf("  Channel     : %d (%.1f MHz, %s)\n",
+                  cfg.channel, freq, BW_STR[bwIdx < 3 ? bwIdx : 3]);
     Serial.printf("  UART baud   : %s bps  [REG0 b7:5=%d]\n", BAUD_STR[baudBits], baudBits);
-    Serial.printf("  UART parity : %s      [REG0 b4:3=%d]\n", PAR_STR[parBits],   parBits);
-    Serial.printf("  Air rate    : %s bps  [REG0 b2:0=%d]\n", AIR_STR[airBits],   airBits);
-    Serial.printf("  Pkt size    : %s B    [REG1 b7:6=%d]\n", PKT_STR[pktBits],   pktBits);
-    Serial.printf("  RSSI noise  : %s      [REG1 b5]\n",   rssiNoise  ? "ENABLED" : "disabled");
-    Serial.printf("  TX power    : %s      [REG1 b1:0=%d]\n", PWR_STR[pwrBits],   pwrBits);
-    Serial.printf("  RSSI append : %s      [REG3 b7]\n",   rssiAppend ? "ENABLED" : "disabled");
-    Serial.printf("  Fixed addr  : %s      [REG3 b6]\n",   fixedMode  ? "ENABLED" : "disabled(transparent)");
-    Serial.printf("  LBT         : %s      [REG3 b5]\n",   lbt        ? "ENABLED" : "disabled");
-    Serial.printf("  WOR period  : %s ms   [REG3 b3:1=%d]\n", WOR_STR[worBits],   worBits);
+    Serial.printf("  Air rate    : %.0f bps  SF%d/%s [REG0 b4:0=0x%02X]\n",
+                  rb, sf, BW_STR[bwIdx < 3 ? bwIdx : 3], airBits);
+    Serial.printf("  Pkt size    : %s B    [REG1 b7:6=%d]\n", PKT_STR[pktBits], pktBits);
+    Serial.printf("  RSSI noise  : %s      [REG1 b5]\n", rssiNoise ? "ENABLED" : "disabled");
+    if (pwrBits == 0)
+        Serial.printf("  TX power    : N/A(0=未定義) [REG1 b3:0=0x0]\n");
+    else
+        Serial.printf("  TX power    : %ddBm        [REG1 b3:0=0x%X]\n", PWR_DBM[pwrBits], pwrBits);
+    Serial.printf("  RSSI append : %s      [REG3 b7]\n", rssiApp ? "ENABLED" : "disabled");
+    Serial.printf("  TX mode     : %s  [REG3 b6]\n", fixedMode ? "通常(固定アドレス)" : "透過");
+    Serial.printf("  TX tbl(22L) : %s     [REG3 b5]\n", txTblB ? "Table B" : "Table A");
+    Serial.printf("  WOR period  : %s ms   [REG3 b2:0=%d]\n", WOR_STR[worBits < 8 ? worBits : 6], worBits);
 }
 
 // ===== E220 設定チェック・自動書き込み =====
@@ -371,6 +389,7 @@ static void e220ConfigureIfNeeded() {
                       current.addL    == DESIRED_ADDL    &&
                       current.channel == DESIRED_CHANNEL &&
                       current.reg0    == DESIRED_REG0    &&
+                      current.reg1    == DESIRED_REG1    &&
                       current.reg3    == DESIRED_REG3);
 
         if (match) {
@@ -424,8 +443,8 @@ void setup() {
     pinMode(PIN_LORA_M1,  OUTPUT);
     pinMode(PIN_LORA_AUX, INPUT);
 
-    // ---- Serial2 起動（通常動作モード: 115200bps） ----
-    serial2Begin(115200);
+    // ---- Serial2 起動（通常動作モード: 9600bps） ----
+    serial2Begin(9600);
 
     // ---- E220初期化完了待ち（AUX=HIGH確認） ----
     Serial.println("Waiting for E220 init (AUX=HIGH)...");

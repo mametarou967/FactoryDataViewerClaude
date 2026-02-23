@@ -27,18 +27,39 @@ DEFAULT_BAUD = 9600   # E220コンフィグモードは常に9600bps固定
 # ===== GWに書き込む設定値 =====
 GW_ADDH    = 0x00   # GWアドレス上位（0x0000 固定）
 GW_ADDL    = 0x00   # GWアドレス下位
-GW_REG0    = 0xE4   # 115200bps / 8N1 / 9.6kbps air rate
-                    #   bits[7:5]=111(115200) bits[4:3]=00(8N1) bits[2:0]=100(9.6k)
-GW_REG1    = 0x00   # 200バイトパケット / RSSI無効 / 22dBm
-GW_CHANNEL = 18     # ch=18（工場1デフォルト）
-GW_REG3    = 0x40   # 固定アドレスモード（bit6=1）
+GW_REG0    = 0x64   # 9600bps UART / 9375bps air (SF6/BW125kHz)
+                    #   bits[7:5]=011(9600bps) bits[4:0]=00100(SF6/BW125k)
+GW_REG1    = 0x01   # 200バイトパケット / RSSI無効 / 13dBm(22S JPデフォルト)
+                    #   bits[7:6]=00(200B) bit5=0(RSSI無効) bits[3:0]=0001(13dBm)
+GW_CHANNEL = 2      # JP版: BW125kHz→921.0MHz, BW500kHz→921.2MHz (Zone A: 920.6-923.4 MHz)
+GW_REG3    = 0x40   # 通常送信モード（固定アドレス）bit6=1
 
-# 表示用マップ
-AIR_RATE_MAP = {0: "0.3k", 1: "1.2k", 2: "2.4k", 3: "4.8k",
-                4: "9.6k", 5: "19.2k", 6: "38.4k", 7: "62.5k"}
+# 表示用マップ (JP版: E220-900T22S/22L(JP) firmware v2.0)
+# REG0 bits[4:0] = エアレート(SF/BW複合5ビット): bits[1:0]=BW, bits[4:2]=SF-5
+AIR_RATE_MAP = {
+    # BW125kHz (CH200kHz間隔, Zone A: CH0-14)
+    0x00: "15625bps(SF5/BW125k)", 0x04: "9375bps(SF6/BW125k)",
+    0x08: "5469bps(SF7/BW125k)",  0x0C: "3125bps(SF8/BW125k)",
+    0x10: "1758bps(SF9/BW125k)",
+    # BW250kHz
+    0x01: "31250bps(SF5/BW250k)", 0x05: "18750bps(SF6/BW250k)",
+    0x09: "10938bps(SF7/BW250k)", 0x0D: "6250bps(SF8/BW250k)",
+    0x11: "3516bps(SF9/BW250k)",  0x15: "1953bps(SF10/BW250k)",
+    # BW500kHz
+    0x02: "62500bps(SF5/BW500k)", 0x06: "37500bps(SF6/BW500k)",
+    0x0A: "21875bps(SF7/BW500k)", 0x0E: "12500bps(SF8/BW500k)",
+    0x12: "7031bps(SF9/BW500k)",  0x16: "3906bps(SF10/BW500k)",
+    0x1A: "2148bps(SF11/BW500k)",
+}
 BAUD_MAP     = {0: "1200", 1: "2400", 2: "4800", 3: "9600",
                 4: "19200", 5: "38400", 6: "57600", 7: "115200"}
-POWER_MAP    = {0: "22dBm", 1: "17dBm", 2: "13dBm", 3: "10dBm"}
+# REG1 bits[3:0] = TX電力 (JP版 22S: 0=未定義, 1=13dBm(default), 2=7dBm, 3=0dBm, 4-15=1-12dBm)
+POWER_MAP    = {
+    0x0: "N/A(未定義)", 0x1: "13dBm", 0x2: "7dBm",  0x3: "0dBm",
+    0x4: "1dBm",  0x5: "2dBm",  0x6: "3dBm",  0x7: "4dBm",
+    0x8: "5dBm",  0x9: "6dBm",  0xA: "7dBm",  0xB: "8dBm",
+    0xC: "9dBm",  0xD: "10dBm", 0xE: "11dBm", 0xF: "12dBm",
+}
 
 
 def open_port(port, baud):
@@ -85,18 +106,26 @@ def read_config(ser):
 
 
 def print_config(cfg, label="設定"):
+    # JP版: REG0 bits[7:5]=UARTボーレート, bits[4:0]=エアレート(SF/BW複合)  ※パリティフィールドなし
+    # JP版: REG1 bits[3:0]=TX電力(22S最大13dBm)
     baud_bits = (cfg["reg0"] >> 5) & 0x07
-    air_bits  = cfg["reg0"] & 0x07
-    pwr_bits  = cfg["reg1"] & 0x03
-    fixed     = bool(cfg["reg3"] & 0x40)
+    air_bits  =  cfg["reg0"] & 0x1F           # JP版: bits[4:0] (5ビット)
+    pwr_bits  =  cfg["reg1"] & 0x0F           # JP版 22S: bits[3:0] (4ビット)
+    fixed     = bool(cfg["reg3"] & 0x40)      # bit6=1: 通常送信(固定アドレス)
+
+    # BW依存の周波数計算
+    bw_idx   = air_bits & 0x03
+    bw_base  = [920.6, 920.7, 920.8]
+    freq     = bw_base[bw_idx] + cfg["channel"] * 0.2 if bw_idx < 3 else 0.0
+    bw_label = ["BW125k", "BW250k", "BW500k", "??"][bw_idx if bw_idx < 3 else 3]
 
     print(f"  [{label}]")
     print(f"    アドレス          : 0x{cfg['addH']:02X}{cfg['addL']:02X}")
     print(f"    UARTボーレート    : {BAUD_MAP.get(baud_bits, '?')} bps")
-    print(f"    エアレート        : {AIR_RATE_MAP.get(air_bits, '?')} bps")
-    print(f"    チャンネル        : {cfg['channel']} (freq={850.125 + cfg['channel']:.3f} MHz)")
+    print(f"    エアレート        : {AIR_RATE_MAP.get(air_bits, f'不明(0x{air_bits:02X})')}")
+    print(f"    チャンネル        : {cfg['channel']} ({freq:.1f} MHz, {bw_label})")
     print(f"    TX電力            : {POWER_MAP.get(pwr_bits, '?')}")
-    print(f"    固定アドレスモード: {'有効 ✓' if fixed else '無効（透過モード）'}")
+    print(f"    送信モード        : {'通常(固定アドレス) ✓' if fixed else '透過モード'}")
     print(f"    REG0=0x{cfg['reg0']:02X} REG1=0x{cfg['reg1']:02X} REG3=0x{cfg['reg3']:02X}")
 
 

@@ -21,7 +21,7 @@ import sys
 
 # ===== デフォルト設定 =====
 DEFAULT_PORT    = "/dev/ttyUSB0"
-DEFAULT_BAUD    = 115200
+DEFAULT_BAUD    = 9600
 DEFAULT_ADDR    = 0x0101  # エッジのLoRaアドレス（0xMMTT形式）
 DEFAULT_CHANNEL = 18      # LoRaチャンネル
 
