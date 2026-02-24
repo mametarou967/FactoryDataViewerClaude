@@ -1,22 +1,64 @@
 /**
- * edge_unit.ino  –  Phase 2 Step2: ポーリング応答（ダミーデータ）
+ * edge_unit.ino  –  Phase 2 Step3: センサー統合（デュアルコア）TSL2561フェーズ
  *
  * 実装内容:
  *   - E220ドライバ（モード切替・設定読み取り・設定書き込み）
  *   - AUX割り込みによるコマンド受信基盤
  *   - 起動時 AUX=HIGH 待ち（E220初期化完了確認後に割り込み有効化）
  *   - K(Ping) / V(Version) / H(HW情報) / E(Error) 応答
- *   - P(Patlite) / C(Current) ダミーデータ応答
+ *   - P(Patlite): Core1がTSL2561を常時サンプリング → 実センサー値で応答
+ *   - C(Current): ダミー応答（Step3-2 MCP3208フェーズで実装）
  *   - 初回起動時 E220 自動設定（DESIRED_* 定数に基づく）
+ *   - DIPスイッチによるユニット種別判定
+ *   - Core1/Core0 mutex_t コア間共有データ保護
+ *   - D1ハートビート: Core0+Core1の両方が生きているときのみ点滅
  *
  * 未実装（後続Step）:
- *   - デュアルコア センサーサンプリング（Step3: ダミー→実センサーに置換）
+ *   - MCP3208高速サンプリング + RMS計算（Step3-2: 電流ユニット対応）
  *   - 設定UI・E220設定変更（Step4）
  *   - ローカルテストモード（Step5）
  *
  * E220 コンフィグモード(M0=HIGH,M1=HIGH)では UART は常に 9600bps 固定。
  * 通常動作モードでは DESIRED_REG0 に設定したボーレート（9600bps）を使用する。
  */
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_TSL2561_U.h>
+#include <pico/mutex.h>
+
+// ===== Unit Type =====
+static const uint8_t UNIT_PATLITE = 0x01;
+static const uint8_t UNIT_CURRENT = 0x02;
+
+static uint8_t g_unit_type = 0;
+
+// ===== I2C / TCA9548A =====
+static const uint8_t PIN_I2C0_SDA = 20;
+static const uint8_t PIN_I2C0_SCL = 21;
+static const uint8_t TCA_ADDR     = 0x70;
+
+// ===== コア間共有データ =====
+struct SharedData {
+    float    patlite_max[3];   // TCA CH0/1/2 の直近1.5秒max値 [lux]
+    float    current_rms;      // RMS電流値 [A] (Step3-2で実装)
+    bool     sensor_error;     // センサー異常フラグ
+    uint32_t core1_heartbeat;  // Core1生存確認カウンタ
+};
+static SharedData g_shared = {};
+static mutex_t    g_mutex;
+
+// ===== TSL2561センサー =====
+static Adafruit_TSL2561_Unified g_tsl0(TSL2561_ADDR_FLOAT, 1000);
+static Adafruit_TSL2561_Unified g_tsl1(TSL2561_ADDR_FLOAT, 1001);
+static Adafruit_TSL2561_Unified g_tsl2(TSL2561_ADDR_FLOAT, 1002);
+static Adafruit_TSL2561_Unified *g_tsl[3] = {&g_tsl0, &g_tsl1, &g_tsl2};
+static bool g_tsl_ok[3] = {};
+
+// ===== 1.5秒maxウィンドウ（Core1ローカル） =====
+static const uint32_t PATLITE_WINDOW_MS = 1500;
+static float    g_patlite_local_max[3]  = {};
+static uint32_t g_patlite_expire_ms[3]  = {};
 
 // ===== Pin Assignment (CLAUDE.md 準拠) =====
 static const uint8_t PIN_LORA_M0   =  2;
@@ -83,10 +125,11 @@ static volatile bool g_auxRise = false;
 static void onAuxRise() { g_auxRise = true; }
 
 // ===== 状態変数 =====
-static uint32_t g_lastHbMs   = 0;
-static bool     g_ledD1State = false;
-static uint32_t g_lastRxMs   = 0;
-static bool     g_loraOk     = false;
+static uint32_t g_lastHbMs    = 0;
+static bool     g_ledD1State  = false;
+static uint32_t g_lastRxMs    = 0;
+static bool     g_loraOk      = false;
+static uint32_t g_lastCore1Hb = 0;
 
 // ===== Serial2 初期化ヘルパー =====
 static void serial2Begin(uint32_t baud) {
@@ -241,7 +284,62 @@ static void onRxSuccess() {
     digitalWrite(PIN_LED_D2, HIGH);
 }
 
+// ===== TCA9548A チャンネル選択 =====
+static void tcaSelect(uint8_t ch) {
+    Wire.beginTransmission(TCA_ADDR);
+    Wire.write(1 << ch);
+    Wire.endTransmission();
+}
+
+// ===== lux値をuint16_tに変換（クランプ） =====
+static uint16_t luxToU16(float f) {
+    if (f < 0.0f)     return 0;
+    if (f > 65535.0f) return 65535;
+    return (uint16_t)f;
+}
+
+// ===== 1.5秒maxウィンドウ更新（Core1から呼ぶ） =====
+static void updatePatliteMax(uint8_t ch, float lux) {
+    uint32_t now = millis();
+    if (lux > g_patlite_local_max[ch]) {
+        g_patlite_local_max[ch] = lux;
+        g_patlite_expire_ms[ch] = now + PATLITE_WINDOW_MS;
+    } else if (now >= g_patlite_expire_ms[ch]) {
+        g_patlite_local_max[ch] = lux;
+        if (lux > 0.0f) g_patlite_expire_ms[ch] = now + PATLITE_WINDOW_MS;
+    }
+}
+
+// ===== TSL2561 初期化（setup()内のCore0から呼ぶ） =====
+static void initPatliteSensors() {
+    bool any_error = false;
+    for (uint8_t ch = 0; ch < 3; ch++) {
+        tcaSelect(ch);
+        delay(2);
+        if (!g_tsl[ch]->begin()) {
+            Serial.printf("  [ERROR] TSL2561 not found on TCA CH%d\n", ch);
+            g_tsl_ok[ch] = false;
+            any_error = true;
+        } else {
+            g_tsl[ch]->setGain(TSL2561_GAIN_1X);
+            g_tsl[ch]->setIntegrationTime(TSL2561_INTEGRATIONTIME_13MS);
+            g_tsl_ok[ch] = true;
+            Serial.printf("  TSL2561 ready on TCA CH%d (13ms/1X)\n", ch);
+        }
+    }
+    mutex_enter_blocking(&g_mutex);
+    g_shared.sensor_error = any_error;
+    mutex_exit(&g_mutex);
+    if (any_error) digitalWrite(PIN_LED_D3, HIGH);
+}
+
 // ===== コマンドハンドラ =====
+
+static void cmdError(uint8_t code) {
+    uint8_t resp[] = {g_e220.addH, g_e220.addL, 'E', code, '\r', '\n'};
+    sendToGW(resp, sizeof(resp));
+    Serial.printf("[E] Error 0x%02X sent\n", code);
+}
 
 static void cmdPing() {
     uint8_t resp[] = {g_e220.addH, g_e220.addL, 'K', '\r', '\n'};
@@ -287,20 +385,35 @@ static void cmdHwInfo() {
 }
 
 static void cmdPatlite() {
-    // Step2: ダミー値。Step3でCore1の共有データに置換する
-    uint16_t red_lux = 300;   // ダミー: 赤点灯相当
-    uint16_t yel_lux = 0;     // ダミー: 黄消灯
-    uint16_t grn_lux = 500;   // ダミー: 緑点灯相当
+    if (!(g_unit_type & UNIT_PATLITE)) {
+        cmdError(ERR_SENSOR_FAIL);
+        return;
+    }
+    float    local_max[3];
+    bool     sensor_err;
+    mutex_enter_blocking(&g_mutex);
+    local_max[0] = g_shared.patlite_max[0];
+    local_max[1] = g_shared.patlite_max[1];
+    local_max[2] = g_shared.patlite_max[2];
+    sensor_err   = g_shared.sensor_error;
+    mutex_exit(&g_mutex);
+
+    if (sensor_err) { cmdError(ERR_SENSOR_FAIL); return; }
+
+    uint16_t red = luxToU16(local_max[0]);
+    uint16_t yel = luxToU16(local_max[1]);
+    uint16_t grn = luxToU16(local_max[2]);
     uint8_t resp[] = {
         g_e220.addH, g_e220.addL, 'P',
-        (uint8_t)(red_lux >> 8), (uint8_t)(red_lux & 0xFF),
-        (uint8_t)(yel_lux >> 8), (uint8_t)(yel_lux & 0xFF),
-        (uint8_t)(grn_lux >> 8), (uint8_t)(grn_lux & 0xFF),
+        (uint8_t)(red >> 8), (uint8_t)(red & 0xFF),
+        (uint8_t)(yel >> 8), (uint8_t)(yel & 0xFF),
+        (uint8_t)(grn >> 8), (uint8_t)(grn & 0xFF),
         '\r', '\n'
     };
     sendToGW(resp, sizeof(resp));
     onRxSuccess();
-    Serial.printf("[P] Patlite dummy: red=%d yel=%d grn=%d\n", red_lux, yel_lux, grn_lux);
+    Serial.printf("[P] Patlite: red=%.1f yel=%.1f grn=%.1f lux\n",
+                  local_max[0], local_max[1], local_max[2]);
 }
 
 static void cmdCurrent() {
@@ -314,12 +427,6 @@ static void cmdCurrent() {
     sendToGW(resp, sizeof(resp));
     onRxSuccess();
     Serial.printf("[C] Current dummy: %d (%.2fA)\n", current_raw, current_raw / 100.0f);
-}
-
-static void cmdError(uint8_t code) {
-    uint8_t resp[] = {g_e220.addH, g_e220.addL, 'E', code, '\r', '\n'};
-    sendToGW(resp, sizeof(resp));
-    Serial.printf("[E] Error 0x%02X sent\n", code);
 }
 
 // ===== コマンド受信・ディスパッチ =====
@@ -448,6 +555,9 @@ static void e220ConfigureIfNeeded() {
 
 // ===== Setup =====
 void setup() {
+    // ---- mutex は最初に初期化（Core1起動前に必須） ----
+    mutex_init(&g_mutex);
+
     Serial.begin(115200);
     uint32_t t0 = millis();
     while (!Serial && millis() - t0 < 5000) delay(10);
@@ -468,6 +578,14 @@ void setup() {
     pinMode(PIN_DIP3, INPUT_PULLUP);
     pinMode(PIN_DIP4, INPUT_PULLUP);
 
+    // ---- ユニット種別判定（DIPスイッチ） ----
+    if (digitalRead(PIN_DIP1) == LOW) g_unit_type |= UNIT_PATLITE;
+    if (digitalRead(PIN_DIP2) == LOW) g_unit_type |= UNIT_CURRENT;
+    Serial.printf("Unit type: 0x%02X (%s%s)\n",
+        g_unit_type,
+        (g_unit_type & UNIT_PATLITE) ? "patlite " : "",
+        (g_unit_type & UNIT_CURRENT) ? "current"  : "");
+
     // ---- E220 モード制御ピン ----
     pinMode(PIN_LORA_M0,  OUTPUT);
     pinMode(PIN_LORA_M1,  OUTPUT);
@@ -487,14 +605,15 @@ void setup() {
     // ---- E220 設定確認・必要なら書き込み ----
     e220ConfigureIfNeeded();
 
-    // ---- DIPスイッチ状態表示 ----
-    uint8_t dip = 0;
-    if (digitalRead(PIN_DIP1) == LOW) dip |= 0x01;
-    if (digitalRead(PIN_DIP2) == LOW) dip |= 0x02;
-    Serial.printf("DIP: 0x%02X (%s%s)\n",
-        dip,
-        (dip & 0x01) ? "patlite " : "",
-        (dip & 0x02) ? "current" : "");
+    // ---- パトライトユニット: I2C + TSL2561 初期化 ----
+    if (g_unit_type & UNIT_PATLITE) {
+        Serial.println("Init I2C (Wire) for TCA9548A + TSL2561...");
+        Wire.setSDA(PIN_I2C0_SDA);
+        Wire.setSCL(PIN_I2C0_SCL);
+        Wire.begin();
+        Serial.println("Init TSL2561 sensors...");
+        initPatliteSensors();
+    }
 
     // ---- AUX割り込み有効化 ----
     attachInterrupt(digitalPinToInterrupt(PIN_LORA_AUX), onAuxRise, RISING);
@@ -511,12 +630,23 @@ void loop() {
         }
     }
 
-    // D1 ハートビート（Step3でCore1生存確認を追加予定）
+    // D1 ハートビート（Core0+Core1 両方が生きているときのみ点滅）
     uint32_t now = millis();
     if (now - g_lastHbMs >= 500) {
-        g_lastHbMs   = now;
-        g_ledD1State = !g_ledD1State;
-        digitalWrite(PIN_LED_D1, g_ledD1State);
+        g_lastHbMs = now;
+        uint32_t c1hb;
+        bool sensor_err;
+        mutex_enter_blocking(&g_mutex);
+        c1hb       = g_shared.core1_heartbeat;
+        sensor_err = g_shared.sensor_error;
+        mutex_exit(&g_mutex);
+        bool core1_alive = (c1hb != g_lastCore1Hb);
+        g_lastCore1Hb = c1hb;
+        if (core1_alive) {
+            g_ledD1State = !g_ledD1State;
+            digitalWrite(PIN_LED_D1, g_ledD1State);
+        }
+        digitalWrite(PIN_LED_D3, sensor_err ? HIGH : LOW);
     }
 
     // D2 LoRa通信状態
@@ -528,6 +658,30 @@ void loop() {
 
 }
 
-// ===== Core1 (Step3で実装予定) =====
-// void setup1() { ... }
-// void loop1()  { ... }
+// ===== Core1 =====
+// Wire/センサーはCore0のsetup()で初期化済み。Core1はWireを排他的に使用する。
+void setup1() {}
+
+void loop1() {
+    if (g_unit_type & UNIT_PATLITE) {
+        for (uint8_t ch = 0; ch < 3; ch++) {
+            if (!g_tsl_ok[ch]) continue;
+            sensors_event_t event;
+            tcaSelect(ch);
+            delay(2);
+            g_tsl[ch]->getEvent(&event);
+            updatePatliteMax(ch, event.light);
+        }
+        mutex_enter_blocking(&g_mutex);
+        g_shared.patlite_max[0] = g_patlite_local_max[0];
+        g_shared.patlite_max[1] = g_patlite_local_max[1];
+        g_shared.patlite_max[2] = g_patlite_local_max[2];
+        g_shared.core1_heartbeat++;
+        mutex_exit(&g_mutex);
+    } else {
+        mutex_enter_blocking(&g_mutex);
+        g_shared.core1_heartbeat++;
+        mutex_exit(&g_mutex);
+        delay(50);
+    }
+}
