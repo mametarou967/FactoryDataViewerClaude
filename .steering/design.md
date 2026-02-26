@@ -281,24 +281,31 @@ Core0のみ生存確認では不十分なため、Core1のカウンタを使っ�
 // Core1: loop1()内でカウンタを更新
 void loop1() {
     // センサーサンプリング処理...
-    mutex_enter_blocking(&shared_mutex);
-    shared_data.core1_heartbeat++;
-    mutex_exit(&shared_mutex);
+    mutex_enter_blocking(&g_mutex);
+    g_shared.core1_heartbeat++;
+    mutex_exit(&g_mutex);
 }
 
-// Core0: 1秒ごとにカウンタ変化を確認してD1を制御
-uint32_t last_core1_hb = 0;
-void updateHeartbeat() {
-    uint32_t current_hb = shared_data.core1_heartbeat;  // mutex省略可（読み取りのみ）
-    bool core1_alive = (current_hb != last_core1_hb);
-    last_core1_hb = current_hb;
-    if (core1_alive) digitalWrite(PIN_LED_D1, !digitalRead(PIN_LED_D1));
-    // Core1フリーズ時はカウンタが変わらず → D1点滅停止
+// Core0: 5秒周期でカウンタ変化を確認し、変化があれば100msパルス点灯
+// D1_PERIOD_MS = 5000, D1_FLASH_MS = 100
+if (now - g_lastHbMs >= D1_PERIOD_MS) {
+    g_lastHbMs = now;
+    bool core1_alive = (c1hb != g_lastCore1Hb);
+    g_lastCore1Hb = c1hb;
+    if (core1_alive) {
+        g_d1FlashMs = now;
+        digitalWrite(PIN_LED_D1, HIGH);  // パルス点灯開始
+    }
+}
+// D1パルス消灯（100ms後）
+if (g_d1FlashMs > 0 && (now - g_d1FlashMs >= D1_FLASH_MS)) {
+    g_d1FlashMs = 0;
+    digitalWrite(PIN_LED_D1, LOW);
 }
 ```
-- Core0フリーズ → D1点滅停止（従来通り）
-- Core1フリーズ → カウンタ不変 → D1点滅停止
-- 両方正常 → D1が1秒周期で点滅
+- Core0フリーズ → D1ピカッ停止
+- Core1フリーズ → カウンタ不変 → D1ピカッ停止
+- 両方正常 → D1が5秒周期で100msピカッと点滅（青）
 - **注意**: Wire / Wire1 / SPI は必ずCore0の `setup()` 内で初期化すること
   （arduino-picoでは `setup1()` は `setup()` 完了後に起動されるため安全）
 

@@ -22,7 +22,7 @@
 | DIP3 予備 | GPIO12 | SW5 |
 | DIP4 予備 | GPIO13 | SW5 |
 | LED ハートビート | GPIO28 | D1(青): Core0+Core1の両方が生きているときのみ5秒周期でピカッと点滅 |
-| LED LoRa通信状態 | GPIO22 | D2: LoRa受信時に100msピカッと点滅 |
+| LED LoRa通信状態 | GPIO22 | D2(緑): LoRa受信時に100msピカッと点滅 |
 | LED モード表示 | GPIO14 | D3(黄): 設定/テストモード中点灯 |
 | LED センサー異常 | GPIO15 | D4(赤): センサーエラー時点灯 |
 | SPI MISO | GPIO16 | MCP3208 |
