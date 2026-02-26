@@ -1,20 +1,19 @@
 /**
- * edge_unit.ino  –  Phase 2 Step3: センサー統合（デュアルコア）TSL2561フェーズ
+ * edge_unit.ino  –  Phase 2 Step3: センサー統合（デュアルコア）
  *
  * 実装内容:
  *   - E220ドライバ（モード切替・設定読み取り・設定書き込み）
  *   - AUX割り込みによるコマンド受信基盤
  *   - 起動時 AUX=HIGH 待ち（E220初期化完了確認後に割り込み有効化）
  *   - K(Ping) / V(Version) / H(HW情報) / E(Error) 応答
- *   - P(Patlite): Core1がTSL2561を常時サンプリング → 実センサー値で応答
- *   - C(Current): ダミー応答（Step3-2 MCP3208フェーズで実装）
- *   - 初回起動時 E220 自動設定（DESIRED_* 定数に基づく）
+ *   - P(Patlite): Core1がTSL2561を常時サンプリング（13ms/GAIN_1X + 1.5秒maxウィンドウ）
+ *   - C(Current): Core1がMCP3208を~1kHzサンプリング → RMS計算 → 実電流値で応答
+ *   - 初回起動時 E220 自動設定（DESIRED_ADDH 定数 + DIPから自動設定される ADDL に基づく）
  *   - DIPスイッチによるユニット種別判定
  *   - Core1/Core0 mutex_t コア間共有データ保護
  *   - D1ハートビート: Core0+Core1の両方が生きているときのみ点滅
  *
  * 未実装（後続Step）:
- *   - MCP3208高速サンプリング + RMS計算（Step3-2: 電流ユニット対応）
  *   - 設定UI・E220設定変更（Step4）
  *   - ローカルテストモード（Step5）
  *
@@ -23,6 +22,7 @@
  */
 
 #include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_TSL2561_U.h>
 #include <pico/mutex.h>
@@ -41,7 +41,7 @@ static const uint8_t TCA_ADDR     = 0x70;
 // ===== コア間共有データ =====
 struct SharedData {
     float    patlite_max[3];   // TCA CH0/1/2 の直近1.5秒max値 [lux]
-    float    current_rms;      // RMS電流値 [A] (Step3-2で実装)
+    float    current_rms;      // RMS電流値 [A]
     bool     sensor_error;     // センサー異常フラグ
     uint32_t core1_heartbeat;  // Core1生存確認カウンタ
 };
@@ -60,6 +60,22 @@ static const uint32_t PATLITE_WINDOW_MS = 1500;
 static float    g_patlite_local_max[3]  = {};
 static uint32_t g_patlite_expire_ms[3]  = {};
 
+// ===== MCP3208 電流計測 =====
+// 回路: CTL-24-CLS → R1(10Ω) → 計測点 (DCバイアス1.65V) → MCP3208 CH0
+// 変換: Io(Arms) = Vac_rms(V) × 200  ※ n/RL = 2000/10 = 200, K≈1 (Io≥10A)
+static const uint8_t  PIN_SPI_MISO      = 16;
+static const uint8_t  PIN_SPI_CS        = 17;
+static const uint8_t  PIN_SPI_SCK       = 18;
+static const uint8_t  PIN_SPI_MOSI      = 19;
+static const uint8_t  ADC_CURRENT_CH    = 0;      // MCP3208 CH0
+static const int32_t  ADC_DC_OFFSET     = 2048;   // 1.65V / 3.3V × 4096
+static const uint32_t CURRENT_WINDOW_MS = 100;    // RMSウィンドウ（50Hzで5周期）
+
+// 電流計測（Core1ローカル）
+static int64_t  g_current_sum_sq       = 0;
+static uint32_t g_current_count        = 0;
+static uint32_t g_current_window_start = 0;
+
 // ===== Pin Assignment (CLAUDE.md 準拠) =====
 static const uint8_t PIN_LORA_M0   =  2;
 static const uint8_t PIN_LORA_M1   =  3;
@@ -73,8 +89,8 @@ static const uint8_t PIN_DIP1      = 10;
 static const uint8_t PIN_DIP2      = 11;
 static const uint8_t PIN_DIP3      = 12;
 static const uint8_t PIN_DIP4      = 13;
-static const uint8_t PIN_LED_D3    = 14;
-static const uint8_t PIN_LED_D4    = 15;
+static const uint8_t PIN_LED_D3    = 14;  // 黄: モード表示（設定/テストモード中点灯）
+static const uint8_t PIN_LED_D4    = 15;  // 赤: センサー異常（エラー時点灯）
 static const uint8_t PIN_LED_D2    = 22;
 static const uint8_t PIN_LED_D1    = 28;
 
@@ -88,15 +104,18 @@ static const uint8_t ERR_SENSOR_FAIL = 0x01;
 static const uint8_t ERR_UNKNOWN_CMD = 0x02;
 static const uint8_t ERR_TIMEOUT     = 0x03;
 
-// ===== LoRa通信タイムアウト =====
-static const uint32_t LORA_COMMS_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+// ===== LEDフラッシュ時間 =====
+static const uint32_t D1_FLASH_MS   = 100;    // ハートビートパルス幅 [ms]
+static const uint32_t D1_PERIOD_MS  = 5000;   // ハートビート周期 [ms]
+static const uint32_t D2_FLASH_MS   = 100;    // LoRa受信時のピカッ点灯時間 [ms]
 
 // ===== このユニットに書き込みたい E220 設定値 =====
-// ユニットごとに DESIRED_ADDH/ADDL を変更すること（0xMMTT形式）
+// ユニットごとに DESIRED_ADDH を変更すること（機械番号MM、0xMMTT形式）
+// DESIRED_ADDL はDIPスイッチから自動設定（setup()内で g_unit_type を代入）
 // E220-900T22S レジスタマップ（NETIDなし）:
 //   0x00:ADDH  0x01:ADDL  0x02:REG0(SPED)  0x03:REG1  0x04:CHAN  0x05:REG3(OPTION)
-static const uint8_t DESIRED_ADDH    = 0x01;   // machine=1
-static const uint8_t DESIRED_ADDL    = 0x01;   // type=patlite
+static const uint8_t DESIRED_ADDH    = 0x01;   // machine=1（ユニットごとに変更すること）
+static uint8_t       DESIRED_ADDL    = 0x00;   // DIPスイッチから自動設定（setup()で g_unit_type を代入）
 static const uint8_t DESIRED_REG0    = 0x64;   // 9600bps UART / 9375bps air (SF6/BW125kHz)
                                                 //  bits[7:5]=011(9600bps) bits[4:0]=00100(SF6/BW125k)
 static const uint8_t DESIRED_REG1    = 0x01;   // 200バイト / RSSI無効 / 13dBm(22S JPデフォルト)
@@ -126,9 +145,8 @@ static void onAuxRise() { g_auxRise = true; }
 
 // ===== 状態変数 =====
 static uint32_t g_lastHbMs    = 0;
-static bool     g_ledD1State  = false;
-static uint32_t g_lastRxMs    = 0;
-static bool     g_loraOk      = false;
+static uint32_t g_d1FlashMs   = 0;  // D1点灯開始時刻（0=消灯中）
+static uint32_t g_d2FlashMs   = 0;  // D2点灯開始時刻（0=消灯中）
 static uint32_t g_lastCore1Hb = 0;
 
 // ===== Serial2 初期化ヘルパー =====
@@ -279,8 +297,7 @@ static void sendToGW(const uint8_t *payload, uint8_t len) {
 }
 
 static void onRxSuccess() {
-    g_loraOk   = true;
-    g_lastRxMs = millis();
+    g_d2FlashMs = millis();
     digitalWrite(PIN_LED_D2, HIGH);
 }
 
@@ -330,7 +347,21 @@ static void initPatliteSensors() {
     mutex_enter_blocking(&g_mutex);
     g_shared.sensor_error = any_error;
     mutex_exit(&g_mutex);
-    if (any_error) digitalWrite(PIN_LED_D3, HIGH);
+    if (any_error) digitalWrite(PIN_LED_D4, HIGH);
+}
+
+// ===== MCP3208 raw読み取り（single-ended） =====
+static uint16_t readMCP3208_raw(uint8_t ch) {
+    uint8_t tx1 = 0x06;                 // Start=1, SGL=1
+    uint8_t tx2 = (ch & 0x07) << 6;    // D2 D1 D0 を上位3bitに
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_SPI_CS, LOW);
+    SPI.transfer(tx1);
+    uint16_t hi = SPI.transfer(tx2);
+    uint16_t lo = SPI.transfer(0x00);
+    digitalWrite(PIN_SPI_CS, HIGH);
+    SPI.endTransaction();
+    return (uint16_t)((hi & 0x0F) << 8) | lo;  // 12bit結果
 }
 
 // ===== コマンドハンドラ =====
@@ -417,16 +448,24 @@ static void cmdPatlite() {
 }
 
 static void cmdCurrent() {
-    // Step2: ダミー値。Step3でCore1の共有データに置換する
-    uint16_t current_raw = 1234;  // ダミー: 12.34A
+    if (!(g_unit_type & UNIT_CURRENT)) {
+        cmdError(ERR_SENSOR_FAIL);
+        return;
+    }
+    float rms;
+    mutex_enter_blocking(&g_mutex);
+    rms = g_shared.current_rms;
+    mutex_exit(&g_mutex);
+
+    uint16_t val = (uint16_t)(rms * 100.0f);  // 0.01A単位
     uint8_t resp[] = {
         g_e220.addH, g_e220.addL, 'C',
-        (uint8_t)(current_raw >> 8), (uint8_t)(current_raw & 0xFF),
+        (uint8_t)(val >> 8), (uint8_t)(val & 0xFF),
         '\r', '\n'
     };
     sendToGW(resp, sizeof(resp));
     onRxSuccess();
-    Serial.printf("[C] Current dummy: %d (%.2fA)\n", current_raw, current_raw / 100.0f);
+    Serial.printf("[C] Current: %.2f A\n", rms);
 }
 
 // ===== コマンド受信・ディスパッチ =====
@@ -581,10 +620,12 @@ void setup() {
     // ---- ユニット種別判定（DIPスイッチ） ----
     if (digitalRead(PIN_DIP1) == LOW) g_unit_type |= UNIT_PATLITE;
     if (digitalRead(PIN_DIP2) == LOW) g_unit_type |= UNIT_CURRENT;
-    Serial.printf("Unit type: 0x%02X (%s%s)\n",
+    DESIRED_ADDL = g_unit_type;  // DIP値をそのまま E220 ADDL(TT部分)に反映
+    Serial.printf("Unit type: 0x%02X (%s%s) -> ADDL=0x%02X\n",
         g_unit_type,
         (g_unit_type & UNIT_PATLITE) ? "patlite " : "",
-        (g_unit_type & UNIT_CURRENT) ? "current"  : "");
+        (g_unit_type & UNIT_CURRENT) ? "current"  : "",
+        DESIRED_ADDL);
 
     // ---- E220 モード制御ピン ----
     pinMode(PIN_LORA_M0,  OUTPUT);
@@ -615,6 +656,19 @@ void setup() {
         initPatliteSensors();
     }
 
+    // ---- 電流ユニット: SPI + MCP3208 初期化 ----
+    if (g_unit_type & UNIT_CURRENT) {
+        Serial.println("Init SPI for MCP3208...");
+        pinMode(PIN_SPI_CS, OUTPUT);
+        digitalWrite(PIN_SPI_CS, HIGH);
+        SPI.setSCK(PIN_SPI_SCK);
+        SPI.setRX(PIN_SPI_MISO);
+        SPI.setTX(PIN_SPI_MOSI);
+        SPI.begin();
+        g_current_window_start = millis();
+        Serial.println("  MCP3208 ready (CH0, VREF=3.3V)");
+    }
+
     // ---- AUX割り込み有効化 ----
     attachInterrupt(digitalPinToInterrupt(PIN_LORA_AUX), onAuxRise, RISING);
 
@@ -630,9 +684,9 @@ void loop() {
         }
     }
 
-    // D1 ハートビート（Core0+Core1 両方が生きているときのみ点滅）
+    // D1 ハートビートパルス（5秒周期、Core0+Core1 両方が生きているときのみ）
     uint32_t now = millis();
-    if (now - g_lastHbMs >= 500) {
+    if (now - g_lastHbMs >= D1_PERIOD_MS) {
         g_lastHbMs = now;
         uint32_t c1hb;
         bool sensor_err;
@@ -643,17 +697,22 @@ void loop() {
         bool core1_alive = (c1hb != g_lastCore1Hb);
         g_lastCore1Hb = c1hb;
         if (core1_alive) {
-            g_ledD1State = !g_ledD1State;
-            digitalWrite(PIN_LED_D1, g_ledD1State);
+            g_d1FlashMs = now;
+            digitalWrite(PIN_LED_D1, HIGH);
         }
-        digitalWrite(PIN_LED_D3, sensor_err ? HIGH : LOW);
+        digitalWrite(PIN_LED_D4, sensor_err ? HIGH : LOW);
     }
 
-    // D2 LoRa通信状態
-    if (g_loraOk && (millis() - g_lastRxMs >= LORA_COMMS_TIMEOUT_MS)) {
-        g_loraOk = false;
+    // D1 ハートビートパルス消灯
+    if (g_d1FlashMs > 0 && (now - g_d1FlashMs >= D1_FLASH_MS)) {
+        g_d1FlashMs = 0;
+        digitalWrite(PIN_LED_D1, LOW);
+    }
+
+    // D2 LoRa受信フラッシュ（100ms後に消灯）
+    if (g_d2FlashMs > 0 && (millis() - g_d2FlashMs >= D2_FLASH_MS)) {
+        g_d2FlashMs = 0;
         digitalWrite(PIN_LED_D2, LOW);
-        Serial.println("[D2] LoRa comms timeout -> D2 OFF");
     }
 
 }
@@ -663,6 +722,9 @@ void loop() {
 void setup1() {}
 
 void loop1() {
+    bool did_heartbeat = false;
+
+    // === パトライト: TSL2561 高速サイクリング（~45ms/3ch） ===
     if (g_unit_type & UNIT_PATLITE) {
         for (uint8_t ch = 0; ch < 3; ch++) {
             if (!g_tsl_ok[ch]) continue;
@@ -678,7 +740,41 @@ void loop1() {
         g_shared.patlite_max[2] = g_patlite_local_max[2];
         g_shared.core1_heartbeat++;
         mutex_exit(&g_mutex);
-    } else {
+        did_heartbeat = true;
+    }
+
+    // === 電流: MCP3208 1サンプル/ループ + 100ms RMS計算 ===
+    if (g_unit_type & UNIT_CURRENT) {
+        int32_t v_ac = (int32_t)readMCP3208_raw(ADC_CURRENT_CH) - ADC_DC_OFFSET;
+        g_current_sum_sq += (int64_t)v_ac * v_ac;
+        g_current_count++;
+
+        if (millis() - g_current_window_start >= CURRENT_WINDOW_MS) {
+            if (g_current_count > 0) {
+                float rms_counts  = sqrtf((float)g_current_sum_sq / (float)g_current_count);
+                float current_rms = rms_counts * (3.3f / 4096.0f) * 200.0f;
+                mutex_enter_blocking(&g_mutex);
+                g_shared.current_rms = current_rms;
+                mutex_exit(&g_mutex);
+            }
+            g_current_sum_sq       = 0;
+            g_current_count        = 0;
+            g_current_window_start = millis();
+        }
+
+        if (!did_heartbeat) {
+            // 電流ユニット単独: HB更新 + ~1kHz レート制御
+            mutex_enter_blocking(&g_mutex);
+            g_shared.core1_heartbeat++;
+            mutex_exit(&g_mutex);
+            did_heartbeat = true;
+            delayMicroseconds(900);  // SPI転送~100μs込みで合計~1ms/サンプル
+        }
+        // 兼務の場合: パトライトブロックでHB更新済み・TSL2561がレート制限(~45ms/cycle)
+    }
+
+    // === DIP未設定フォールバック ===
+    if (!did_heartbeat) {
         mutex_enter_blocking(&g_mutex);
         g_shared.core1_heartbeat++;
         mutex_exit(&g_mutex);

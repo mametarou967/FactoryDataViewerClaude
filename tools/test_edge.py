@@ -147,7 +147,7 @@ def parse_response(resp, cmd_char):
 
 def run_test(port, baud, edge_addr, channel):
     print(f"{'='*52}")
-    print(f"  Edge Unit テスト  –  Phase 2 Step2")
+    print(f"  Edge Unit テスト  –  Phase 2 Step3-1")
     print(f"    ポート  : {port}  ({baud} bps)")
     print(f"    エッジ  : 0x{edge_addr:04X}  CH={channel}")
     print(f"{'='*52}\n")
