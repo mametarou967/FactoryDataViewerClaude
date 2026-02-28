@@ -61,8 +61,9 @@ static float    g_patlite_local_max[3]  = {};
 static uint32_t g_patlite_expire_ms[3]  = {};
 
 // ===== MCP3208 電流計測 =====
-// 回路: CTL-24-CLS → R1(10Ω) → 計測点 (DCバイアス1.65V) → MCP3208 CH0
-// 変換: Io(Arms) = Vac_rms(V) × 200  ※ n/RL = 2000/10 = 200, K≈1 (Io≥10A)
+// 回路: CTL-24-CLS → R1(100Ω) → 計測点 (DCバイアス1.65V) → MCP3208 CH0
+// 変換: Io(Arms) = Vac_rms(V) × 20   ※ n/RL = 2000/100 = 20, K≈1 (Io≥10A)
+// クリップ: ~23A でADC飽和（22A超の検知用途には問題なし）
 static const uint8_t  PIN_SPI_MISO      = 16;
 static const uint8_t  PIN_SPI_CS        = 17;
 static const uint8_t  PIN_SPI_SCK       = 18;
@@ -75,6 +76,9 @@ static const uint32_t CURRENT_WINDOW_MS = 100;    // RMSウィンドウ（50Hz�
 static int64_t  g_current_sum_sq       = 0;
 static uint32_t g_current_count        = 0;
 static uint32_t g_current_window_start = 0;
+static int64_t  g_current_sum          = 0;      // mean計算用
+static int32_t  g_current_raw_min      = 32767;  // 診断用
+static int32_t  g_current_raw_max      = 0;      // 診断用
 
 // ===== Pin Assignment (CLAUDE.md 準拠) =====
 static const uint8_t PIN_LORA_M0   =  2;
@@ -745,18 +749,33 @@ void loop1() {
 
     // === 電流: MCP3208 1サンプル/ループ + 100ms RMS計算 ===
     if (g_unit_type & UNIT_CURRENT) {
-        int32_t v_ac = (int32_t)readMCP3208_raw(ADC_CURRENT_CH) - ADC_DC_OFFSET;
+        uint16_t raw = readMCP3208_raw(ADC_CURRENT_CH);
+        int32_t v_ac = (int32_t)raw - ADC_DC_OFFSET;
+        g_current_sum    += raw;
+        if ((int32_t)raw < g_current_raw_min) g_current_raw_min = raw;
+        if ((int32_t)raw > g_current_raw_max) g_current_raw_max = raw;
         g_current_sum_sq += (int64_t)v_ac * v_ac;
         g_current_count++;
 
         if (millis() - g_current_window_start >= CURRENT_WINDOW_MS) {
             if (g_current_count > 0) {
                 float rms_counts  = sqrtf((float)g_current_sum_sq / (float)g_current_count);
-                float current_rms = rms_counts * (3.3f / 4096.0f) * 200.0f;
+                float current_rms = rms_counts * (3.3f / 4096.0f) * 20.0f;   // 2000/100Ω
+                float mean_raw    = (float)g_current_sum / (float)g_current_count;
+                float dc_err      = mean_raw - (float)ADC_DC_OFFSET;
+                // [ADC診断] 100msウィンドウごとに出力
+                Serial.printf("[ADC] N=%lu mean=%.1f(%.4fV) min=%d max=%d dc_err=%.1f rms_cnt=%.2f -> %.2fA\n",
+                    g_current_count,
+                    mean_raw, mean_raw * (3.3f / 4096.0f),
+                    g_current_raw_min, g_current_raw_max,
+                    dc_err, rms_counts, current_rms);
                 mutex_enter_blocking(&g_mutex);
                 g_shared.current_rms = current_rms;
                 mutex_exit(&g_mutex);
             }
+            g_current_sum          = 0;
+            g_current_raw_min      = 32767;
+            g_current_raw_max      = 0;
             g_current_sum_sq       = 0;
             g_current_count        = 0;
             g_current_window_start = millis();
