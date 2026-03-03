@@ -1,5 +1,5 @@
 /**
- * edge_unit.ino  –  Phase 2 Step3: センサー統合（デュアルコア）
+ * edge_unit.ino  –  Phase 2 Step4: SSD1306 + ボタンUI
  *
  * 実装内容:
  *   - E220ドライバ（モード切替・設定読み取り・設定書き込み）
@@ -12,9 +12,10 @@
  *   - DIPスイッチによるユニット種別判定
  *   - Core1/Core0 mutex_t コア間共有データ保護
  *   - D1ハートビート: Core0+Core1の両方が生きているときのみ点滅
+ *   - SSD1306 OLED表示（Wire1: GPIO26/27）
+ *   - 3ボタンUI（デバウンス付き）: 設定確認・ADDH変更・CH変更
  *
  * 未実装（後続Step）:
- *   - 設定UI・E220設定変更（Step4）
  *   - ローカルテストモード（Step5）
  *
  * E220 コンフィグモード(M0=HIGH,M1=HIGH)では UART は常に 9600bps 固定。
@@ -25,7 +26,21 @@
 #include <SPI.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_TSL2561_U.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <pico/mutex.h>
+
+// ===== UIモード（インクルード直後に定義: Arduino自動プロトタイプ生成との衝突防止） =====
+enum UIMode : uint8_t {
+    MODE_NORMAL = 0,
+    MODE_MENU,
+    MODE_CONF_VIEW,
+    MODE_EDIT_ADDH,
+    MODE_EDIT_CHANNEL,
+};
+
+// ===== ボタンデバウンス構造体（pollBtnプロトタイプより前に定義必須） =====
+struct BtnState { bool prev; uint32_t lastMs; };
 
 // ===== Unit Type =====
 static const uint8_t UNIT_PATLITE = 0x01;
@@ -37,6 +52,14 @@ static uint8_t g_unit_type = 0;
 static const uint8_t PIN_I2C0_SDA = 20;
 static const uint8_t PIN_I2C0_SCL = 21;
 static const uint8_t TCA_ADDR     = 0x70;
+
+// ===== I2C1 / SSD1306 =====
+static const uint8_t  PIN_I2C1_SDA    = 26;
+static const uint8_t  PIN_I2C1_SCL    = 27;
+static const uint8_t  OLED_ADDR       = 0x3C;
+static const uint8_t  OLED_W          = 128;
+static const uint8_t  OLED_H          = 64;
+static const uint32_t BTN_DEBOUNCE_MS = 150;
 
 // ===== コア間共有データ =====
 struct SharedData {
@@ -143,6 +166,22 @@ static E220Config g_e220 = {
 // ===== AUX割り込みフラグ =====
 static volatile bool g_auxRise = false;
 static void onAuxRise() { g_auxRise = true; }
+
+// ===== SSD1306 OLEDオブジェクト =====
+static Adafruit_SSD1306 g_oled(OLED_W, OLED_H, &Wire1, -1);
+
+// ===== UI状態 =====
+static UIMode g_uiMode = MODE_NORMAL;
+
+// ===== ボタンデバウンスインスタンス =====
+static BtnState g_selState  = {true, 0};
+static BtnState g_okState   = {true, 0};
+static BtnState g_backState = {true, 0};
+
+// ===== UI状態変数 =====
+static int8_t  g_menuCursor = 0;   // 0=Conf, 1=ADDH, 2=Chan, 3=Exit
+static uint8_t g_editValue  = 0;   // 編集中の値
+static uint32_t g_lastOledMs = 0;
 
 // ===== 状態変数 =====
 static uint32_t g_lastHbMs    = 0;
@@ -593,6 +632,163 @@ static void e220ConfigureIfNeeded() {
     }
 }
 
+// ===== ボタンデバウンス: 押下(HIGH→LOW)の立下りエッジ検出 =====
+// 押下・離す問わず信号変化のたびにタイマーをリセットする。
+// これにより、ボタンを長押し後のリリースチャタリングによる誤検知を防ぐ。
+static bool pollBtn(uint8_t pin, BtnState &s) {
+    bool cur = digitalRead(pin);
+    if (cur == s.prev) return false;   // 変化なし
+    uint32_t now = millis();
+    s.prev = cur;
+    if (now - s.lastMs < BTN_DEBOUNCE_MS) { s.lastMs = now; return false; }
+    s.lastMs = now;
+    return !cur;   // LOWになった（押下）のみTRUE
+}
+
+// ===== 通常モードへ戻る（Serial2バッファクリア付き） =====
+static void exitToNormal() {
+    g_uiMode = MODE_NORMAL;
+    while (Serial2.available()) Serial2.read();  // 旧コマンドを破棄
+}
+
+// ===== UIハンドラ =====
+static void handleUI(bool selPr, bool okPr, bool backPr) {
+    switch (g_uiMode) {
+        case MODE_NORMAL:
+            if (okPr) { g_menuCursor = 0; g_uiMode = MODE_MENU; }
+            break;
+
+        case MODE_MENU:
+            if (selPr) g_menuCursor = (g_menuCursor + 1) % 4;
+            if (okPr) {
+                switch (g_menuCursor) {
+                    case 0: g_uiMode = MODE_CONF_VIEW; break;
+                    case 1: g_editValue = g_e220.addH;    g_uiMode = MODE_EDIT_ADDH;    break;
+                    case 2: g_editValue = g_e220.channel; g_uiMode = MODE_EDIT_CHANNEL; break;
+                    case 3: exitToNormal(); break;
+                }
+            }
+            if (backPr) exitToNormal();
+            break;
+
+        case MODE_CONF_VIEW:
+            if (backPr || okPr) g_uiMode = MODE_MENU;
+            break;
+
+        case MODE_EDIT_ADDH:
+            if (selPr) g_editValue = (g_editValue + 1) & 0xFF;  // 0→255→0 ラップ
+            if (okPr) {
+                E220Config newCfg = g_e220;
+                newCfg.addH = g_editValue;
+                e220WriteConfig(newCfg);
+                g_e220    = newCfg;
+                g_auxRise = false;  // 書き込み後のスプリアス割り込みをクリア
+                g_uiMode  = MODE_MENU;
+                Serial.printf("[UI] ADDH saved: 0x%02X\n", g_e220.addH);
+            }
+            if (backPr) { Serial.println("[UI] BACK -> MENU (cancel)"); g_uiMode = MODE_MENU; }
+            break;
+
+        case MODE_EDIT_CHANNEL:
+            if (selPr) g_editValue = (g_editValue + 1) % 32;  // CH 0-31
+            if (okPr) {
+                E220Config newCfg = g_e220;
+                newCfg.channel = g_editValue;
+                e220WriteConfig(newCfg);
+                g_e220    = newCfg;
+                g_auxRise = false;  // 書き込み後のスプリアス割り込みをクリア
+                g_uiMode  = MODE_MENU;
+                Serial.printf("[UI] Channel saved: %d\n", g_e220.channel);
+            }
+            if (backPr) g_uiMode = MODE_MENU;
+            break;
+    }
+}
+
+// ===== OLED描画（200ms間隔） =====
+static void updateOLED() {
+    uint32_t now = millis();
+    if (now - g_lastOledMs < 200) return;
+    g_lastOledMs = now;
+
+    g_oled.clearDisplay();
+    g_oled.setTextSize(1);
+    g_oled.setTextColor(SSD1306_WHITE);
+
+    char buf[24];
+
+    switch (g_uiMode) {
+        case MODE_NORMAL:
+            // line0: アドレス
+            snprintf(buf, sizeof(buf), "addr:0x%02X%02X", g_e220.addH, g_e220.addL);
+            g_oled.setCursor(0, 0);  g_oled.print(buf);
+            // line1: チャンネル + バージョン
+            snprintf(buf, sizeof(buf), "CH:%2d  v%d.%d.%d",
+                     g_e220.channel, FW_MAJOR, FW_MINOR, FW_PATCH);
+            g_oled.setCursor(0, 8);  g_oled.print(buf);
+            // line2: ユニット種別
+            g_oled.setCursor(0, 16);
+            if ((g_unit_type & (UNIT_PATLITE | UNIT_CURRENT)) == (UNIT_PATLITE | UNIT_CURRENT))
+                g_oled.print("patlite+cur");
+            else if (g_unit_type & UNIT_PATLITE)
+                g_oled.print("patlite");
+            else if (g_unit_type & UNIT_CURRENT)
+                g_oled.print("current");
+            else
+                g_oled.print("none");
+            // line7: ヒント
+            g_oled.setCursor(0, 56); g_oled.print("[OK]Menu");
+            break;
+
+        case MODE_MENU:
+            g_oled.setCursor(0, 0);  g_oled.print("=== MENU ===");
+            {
+                static const char *items[] = {"Conf view", "Edit ADDH", "Edit Chan", "Exit"};
+                for (int i = 0; i < 4; i++) {
+                    snprintf(buf, sizeof(buf), "%c%s",
+                             (g_menuCursor == i) ? '>' : ' ', items[i]);
+                    g_oled.setCursor(0, 16 + i * 8);
+                    g_oled.print(buf);
+                }
+            }
+            break;
+
+        case MODE_CONF_VIEW:
+            snprintf(buf, sizeof(buf), "addr:0x%02X%02X", g_e220.addH, g_e220.addL);
+            g_oled.setCursor(0, 0);  g_oled.print(buf);
+            snprintf(buf, sizeof(buf), "CH: %d", g_e220.channel);
+            g_oled.setCursor(0, 8);  g_oled.print(buf);
+            snprintf(buf, sizeof(buf), "R0:%02X  R1:%02X", g_e220.reg0, g_e220.reg1);
+            g_oled.setCursor(0, 16); g_oled.print(buf);
+            snprintf(buf, sizeof(buf), "R3:%02X", g_e220.reg3);
+            g_oled.setCursor(0, 24); g_oled.print(buf);
+            g_oled.setCursor(0, 56); g_oled.print("[BACK]return");
+            break;
+
+        case MODE_EDIT_ADDH:
+            g_oled.setCursor(0, 0);  g_oled.print("--Edit ADDH--");
+            snprintf(buf, sizeof(buf), "now: 0x%02X", g_e220.addH);
+            g_oled.setCursor(0, 16); g_oled.print(buf);
+            snprintf(buf, sizeof(buf), "new: 0x%02X", g_editValue);
+            g_oled.setCursor(0, 24); g_oled.print(buf);
+            g_oled.setCursor(0, 40); g_oled.print("[SEL]+1");
+            g_oled.setCursor(0, 48); g_oled.print("[OK]save [BK]cncl");
+            break;
+
+        case MODE_EDIT_CHANNEL:
+            g_oled.setCursor(0, 0);  g_oled.print("--Edit Chan--");
+            snprintf(buf, sizeof(buf), "now: %d", g_e220.channel);
+            g_oled.setCursor(0, 16); g_oled.print(buf);
+            snprintf(buf, sizeof(buf), "new: %d", g_editValue);
+            g_oled.setCursor(0, 24); g_oled.print(buf);
+            g_oled.setCursor(0, 40); g_oled.print("[SEL]+1");
+            g_oled.setCursor(0, 48); g_oled.print("[OK]save [BK]cncl");
+            break;
+    }
+
+    g_oled.display();
+}
+
 // ===== Setup =====
 void setup() {
     // ---- mutex は最初に初期化（Core1起動前に必須） ----
@@ -670,6 +866,17 @@ void setup() {
         Serial.println("  MCP3208 ready (CH0, VREF=3.3V)");
     }
 
+    // ---- SSD1306 初期化（Wire1: GPIO26/27） ----
+    Wire1.setSDA(PIN_I2C1_SDA);
+    Wire1.setSCL(PIN_I2C1_SCL);
+    Wire1.begin();
+    if (!g_oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println("SSD1306 not found");
+    }
+    g_oled.clearDisplay();
+    g_oled.display();
+    Serial.println("SSD1306 ready");
+
     // ---- AUX割り込み有効化 ----
     attachInterrupt(digitalPinToInterrupt(PIN_LORA_AUX), onAuxRise, RISING);
 
@@ -678,14 +885,26 @@ void setup() {
 
 // ===== Main Loop (Core0) =====
 void loop() {
-    if (g_auxRise) {
+    // ---- ボタンポーリング ----
+    bool selPr  = pollBtn(PIN_BTN_SEL,  g_selState);
+    bool okPr   = pollBtn(PIN_BTN_OK,   g_okState);
+    bool backPr = pollBtn(PIN_BTN_BACK, g_backState);
+
+    // ---- UIハンドラ ----
+    handleUI(selPr, okPr, backPr);
+
+    // ---- AUX割り込み → コマンド処理（通常モード時のみ） ----
+    if (g_uiMode == MODE_NORMAL && g_auxRise) {
         g_auxRise = false;
         if (Serial2.available() >= 3) {
             processCommand();
         }
     }
 
-    // D1 ハートビートパルス（5秒周期、Core0+Core1 両方が生きているときのみ）
+    // ---- D3 LED（メニュー/編集モード中は点灯） ----
+    digitalWrite(PIN_LED_D3, g_uiMode != MODE_NORMAL ? HIGH : LOW);
+
+    // ---- D1 ハートビートパルス（5秒周期、Core0+Core1 両方が生きているときのみ） ----
     uint32_t now = millis();
     if (now - g_lastHbMs >= D1_PERIOD_MS) {
         g_lastHbMs = now;
@@ -704,18 +923,20 @@ void loop() {
         digitalWrite(PIN_LED_D4, sensor_err ? HIGH : LOW);
     }
 
-    // D1 ハートビートパルス消灯
+    // ---- D1 ハートビートパルス消灯 ----
     if (g_d1FlashMs > 0 && (now - g_d1FlashMs >= D1_FLASH_MS)) {
         g_d1FlashMs = 0;
         digitalWrite(PIN_LED_D1, LOW);
     }
 
-    // D2 LoRa受信フラッシュ（100ms後に消灯）
+    // ---- D2 LoRa受信フラッシュ（100ms後に消灯） ----
     if (g_d2FlashMs > 0 && (millis() - g_d2FlashMs >= D2_FLASH_MS)) {
         g_d2FlashMs = 0;
         digitalWrite(PIN_LED_D2, LOW);
     }
 
+    // ---- OLED更新（200ms間隔） ----
+    updateOLED();
 }
 
 // ===== Core1 =====
