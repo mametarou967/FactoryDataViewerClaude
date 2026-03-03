@@ -269,10 +269,12 @@ shared_data {
     float    current_rms;       // 最新RMS電流値 (A)
     bool     sensor_error;      // センサー異常フラグ
     uint32_t core1_heartbeat;   // Core1生存確認カウンタ（loop1()内でインクリメント）
+    int16_t  wave_buf[128];     // 電流テストモード用波形バッファ（128サンプル @~1kHz）
+    bool     wave_ready;        // true=128サンプル取得完了・Core0が描画可能
 }
 ```
 - `#include <pico/mutex.h>` の `mutex_t` を使用
-- Core1が書き込み、Core0がコマンド応答時に読み出し
+- Core1が書き込み、Core0がコマンド応答・OLED描画時に読み出し
 
 ### D1ハートビートLEDによるデュアルコア監視
 Core0のみ生存確認では不十分なため、Core1のカウンタを使って両コアを監視する。
@@ -311,10 +313,11 @@ if (g_d1FlashMs > 0 && (now - g_d1FlashMs >= D1_FLASH_MS)) {
 
 ### ローカルテストモードのセンサー表示
 - **通常動作時**: Core1が常時サンプリング → shared_dataにmax/RMSを更新し続ける
-- **ローカルテスト時**: スナップショット方式（リアルタイム表示不要）
-  - 計測指示 → Core1が短期間サンプリング実行 → 結果を液晶に表示（1回完結）
-  - 波形表示: 電流の短期バースト（例: 200ms分）をサンプリングしてSSD1306に描画
-  - shared_dataに波形バッファは不要
+- **ローカルテスト時**: スナップショット方式
+  - **パトライトテスト**: Core1が更新し続けるpatlite_max[3]をリアルタイム読み出して液晶表示
+  - **電流テスト**: Core0が `g_wave_capture` フラグを立てる → Core1が128サンプル（~128ms）を
+    wave_buf[]に蓄積 → wave_ready=true → Core0がOLEDに波形描画（128px幅×48px高） + RMS値表示
+  - [SEL]ボタンで新規キャプチャ、[BK]でメニューへ戻る
 
 ## 電流計測回路（MCP3208 + CTL-24-CLS）
 

@@ -37,7 +37,7 @@
 ## 使用ライブラリ
 - `Wire.h` / `Adafruit_Sensor.h` / `Adafruit_TSL2561_U.h`（確定）
 - `SPI.h`（MCP3208）（確定）
-- SSD1306用ライブラリ（`Adafruit SSD1306` または `U8g2`、Step4で確定）
+- `Adafruit_GFX.h` + `Adafruit_SSD1306.h`（SSD1306 OLED、Step4で確定）
 
 ## センサー仕様
 - **TCA9548A**: I2Cマルチプレクサ(0x70)、CH0〜2にTSL2561
