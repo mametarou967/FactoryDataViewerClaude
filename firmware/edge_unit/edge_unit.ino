@@ -179,9 +179,10 @@ static BtnState g_okState   = {true, 0};
 static BtnState g_backState = {true, 0};
 
 // ===== UI状態変数 =====
-static int8_t  g_menuCursor = 0;   // 0=Conf, 1=ADDH, 2=Chan, 3=Exit
-static uint8_t g_editValue  = 0;   // 編集中の値
-static uint32_t g_lastOledMs = 0;
+static int8_t  g_menuCursor    = 0;   // 0=Conf, 1=ADDH, 2=Chan, 3=Exit
+static uint8_t g_editValue     = 0;   // 編集中の値
+static int8_t  g_confScrollPos = 0;   // ConfView スクロール位置（0〜1）
+static uint32_t g_lastOledMs   = 0;
 
 // ===== 状態変数 =====
 static uint32_t g_lastHbMs    = 0;
@@ -662,7 +663,7 @@ static void handleUI(bool selPr, bool okPr, bool backPr) {
             if (selPr) g_menuCursor = (g_menuCursor + 1) % 4;
             if (okPr) {
                 switch (g_menuCursor) {
-                    case 0: g_uiMode = MODE_CONF_VIEW; break;
+                    case 0: g_confScrollPos = 0; g_uiMode = MODE_CONF_VIEW; break;
                     case 1: g_editValue = g_e220.addH;    g_uiMode = MODE_EDIT_ADDH;    break;
                     case 2: g_editValue = g_e220.channel; g_uiMode = MODE_EDIT_CHANNEL; break;
                     case 3: exitToNormal(); break;
@@ -672,35 +673,41 @@ static void handleUI(bool selPr, bool okPr, bool backPr) {
             break;
 
         case MODE_CONF_VIEW:
-            if (backPr || okPr) g_uiMode = MODE_MENU;
+            // SEL: スクロール（0→1→0 循環）
+            if (selPr) g_confScrollPos = (g_confScrollPos + 1) % 2;
+            if (backPr || okPr) { g_confScrollPos = 0; g_uiMode = MODE_MENU; }
             break;
 
         case MODE_EDIT_ADDH:
-            if (selPr) g_editValue = (g_editValue + 1) & 0xFF;  // 0→255→0 ラップ
+            if (selPr)  g_editValue = (g_editValue + 1) & 0xFF;  // +1（0→255→0ラップ）
+            if (backPr) g_editValue = (g_editValue - 1) & 0xFF;  // -1（0→255→0ラップ）
             if (okPr) {
-                E220Config newCfg = g_e220;
-                newCfg.addH = g_editValue;
-                e220WriteConfig(newCfg);
-                g_e220    = newCfg;
-                g_auxRise = false;  // 書き込み後のスプリアス割り込みをクリア
-                g_uiMode  = MODE_MENU;
-                Serial.printf("[UI] ADDH saved: 0x%02X\n", g_e220.addH);
+                if (g_editValue != g_e220.addH) {  // 変更ありのみ書き込み
+                    E220Config newCfg = g_e220;
+                    newCfg.addH = g_editValue;
+                    e220WriteConfig(newCfg);
+                    g_e220    = newCfg;
+                    g_auxRise = false;
+                    Serial.printf("[UI] ADDH saved: 0x%02X\n", g_e220.addH);
+                }
+                g_uiMode = MODE_MENU;
             }
-            if (backPr) { Serial.println("[UI] BACK -> MENU (cancel)"); g_uiMode = MODE_MENU; }
             break;
 
         case MODE_EDIT_CHANNEL:
-            if (selPr) g_editValue = (g_editValue + 1) % 32;  // CH 0-31
+            if (selPr)  g_editValue = (g_editValue + 1) % 32;                    // +1（CH 0-31）
+            if (backPr) g_editValue = (g_editValue == 0) ? 31 : g_editValue - 1; // -1（0→31ラップ）
             if (okPr) {
-                E220Config newCfg = g_e220;
-                newCfg.channel = g_editValue;
-                e220WriteConfig(newCfg);
-                g_e220    = newCfg;
-                g_auxRise = false;  // 書き込み後のスプリアス割り込みをクリア
-                g_uiMode  = MODE_MENU;
-                Serial.printf("[UI] Channel saved: %d\n", g_e220.channel);
+                if (g_editValue != g_e220.channel) {  // 変更ありのみ書き込み
+                    E220Config newCfg = g_e220;
+                    newCfg.channel = g_editValue;
+                    e220WriteConfig(newCfg);
+                    g_e220    = newCfg;
+                    g_auxRise = false;
+                    Serial.printf("[UI] Channel saved: %d\n", g_e220.channel);
+                }
+                g_uiMode = MODE_MENU;
             }
-            if (backPr) g_uiMode = MODE_MENU;
             break;
     }
 }
@@ -753,17 +760,54 @@ static void updateOLED() {
             }
             break;
 
-        case MODE_CONF_VIEW:
-            snprintf(buf, sizeof(buf), "addr:0x%02X%02X", g_e220.addH, g_e220.addL);
-            g_oled.setCursor(0, 0);  g_oled.print(buf);
-            snprintf(buf, sizeof(buf), "CH: %d", g_e220.channel);
-            g_oled.setCursor(0, 8);  g_oled.print(buf);
-            snprintf(buf, sizeof(buf), "R0:%02X  R1:%02X", g_e220.reg0, g_e220.reg1);
-            g_oled.setCursor(0, 16); g_oled.print(buf);
-            snprintf(buf, sizeof(buf), "R3:%02X", g_e220.reg3);
-            g_oled.setCursor(0, 24); g_oled.print(buf);
-            g_oled.setCursor(0, 56); g_oled.print("[BACK]return");
+        case MODE_CONF_VIEW: {
+            // ---- レジスタデコード ----
+            static const char *CV_BAUD[] = {"1200","2400","4800","9600","19200","38400","57600","115200"};
+            static const char *CV_PKT[]  = {"200","128","64","32"};
+            static const char *CV_BW[]   = {"BW125k","BW250k","BW500k","??"};
+            static const char *CV_WOR[]  = {"500","1000","1500","2000","2500","3000","??","??"};
+            static const int8_t CV_PWR[] = {-99,13,7,0,1,2,3,4,5,6,7,8,9,10,11,12};
+            static const float  CV_BASE[]= {920.6f, 920.7f, 920.8f};
+            static const uint32_t CV_BW_HZ[] = {125000, 250000, 500000, 0};
+
+            uint8_t baudBits  = (g_e220.reg0 >> 5) & 0x07;
+            uint8_t airBits   =  g_e220.reg0 & 0x1F;
+            uint8_t bwIdx     =  airBits & 0x03;
+            uint8_t sf        = ((airBits >> 2) & 0x07) + 5;
+            uint8_t pktBits   = (g_e220.reg1 >> 6) & 0x03;
+            bool    rssiNoise = (g_e220.reg1 >> 5) & 0x01;
+            uint8_t pwrBits   =  g_e220.reg1 & 0x0F;
+            bool    rssiApp   = (g_e220.reg3 >> 7) & 0x01;
+            bool    fixedMode = (g_e220.reg3 >> 6) & 0x01;
+            uint8_t worBits   =  g_e220.reg3 & 0x07;
+            float   freq      = (bwIdx < 3) ? CV_BASE[bwIdx] + g_e220.channel * 0.2f : 0.0f;
+            uint32_t rbInt    = (bwIdx < 3 && sf >= 5 && sf <= 12)
+                                ? (uint32_t)((float)sf * CV_BW_HZ[bwIdx] / (1UL << sf) * 0.8f) : 0;
+
+            // ---- 8行コンテンツ生成 ----
+            char lines[8][22];
+            snprintf(lines[0], 22, "addr:0x%02X%02X", g_e220.addH, g_e220.addL);
+            snprintf(lines[1], 22, "CH:%d %.1fMHz", g_e220.channel, freq);
+            snprintf(lines[2], 22, "UART:%sbps", CV_BAUD[baudBits < 8 ? baudBits : 0]);
+            snprintf(lines[3], 22, "Air:%ubps", (unsigned)rbInt);
+            snprintf(lines[4], 22, "SF%d/%s", sf, CV_BW[bwIdx < 3 ? bwIdx : 3]);
+            snprintf(lines[5], 22, "Pkt:%sB Pwr:%ddBm",
+                     CV_PKT[pktBits < 4 ? pktBits : 0], CV_PWR[pwrBits < 16 ? pwrBits : 0]);
+            snprintf(lines[6], 22, "Rn:%s Ra:%s",
+                     rssiNoise ? "on" : "off", rssiApp ? "on" : "off");
+            snprintf(lines[7], 22, "Mode:%s WOR:%sms",
+                     fixedMode ? "Fixed" : "Trans", CV_WOR[worBits < 8 ? worBits : 6]);
+
+            // ---- 7行表示（スクロール位置から）+ ヒント ----
+            int8_t sp = (g_confScrollPos > 1) ? 1 : g_confScrollPos;
+            for (int i = 0; i < 7; i++) {
+                g_oled.setCursor(0, i * 8);
+                g_oled.print(lines[sp + i]);
+            }
+            g_oled.setCursor(0, 56);
+            g_oled.print("[SEL]scrl [BK]ret");
             break;
+        }
 
         case MODE_EDIT_ADDH:
             g_oled.setCursor(0, 0);  g_oled.print("--Edit ADDH--");
@@ -771,8 +815,8 @@ static void updateOLED() {
             g_oled.setCursor(0, 16); g_oled.print(buf);
             snprintf(buf, sizeof(buf), "new: 0x%02X", g_editValue);
             g_oled.setCursor(0, 24); g_oled.print(buf);
-            g_oled.setCursor(0, 40); g_oled.print("[SEL]+1");
-            g_oled.setCursor(0, 48); g_oled.print("[OK]save [BK]cncl");
+            g_oled.setCursor(0, 40); g_oled.print("[S]+1 [BK]-1");
+            g_oled.setCursor(0, 48); g_oled.print("[OK]save");
             break;
 
         case MODE_EDIT_CHANNEL:
@@ -781,8 +825,8 @@ static void updateOLED() {
             g_oled.setCursor(0, 16); g_oled.print(buf);
             snprintf(buf, sizeof(buf), "new: %d", g_editValue);
             g_oled.setCursor(0, 24); g_oled.print(buf);
-            g_oled.setCursor(0, 40); g_oled.print("[SEL]+1");
-            g_oled.setCursor(0, 48); g_oled.print("[OK]save [BK]cncl");
+            g_oled.setCursor(0, 40); g_oled.print("[S]+1 [BK]-1");
+            g_oled.setCursor(0, 48); g_oled.print("[OK]save");
             break;
     }
 
