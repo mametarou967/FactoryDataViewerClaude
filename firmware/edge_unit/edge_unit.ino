@@ -674,7 +674,7 @@ static void handleUI(bool selPr, bool okPr, bool backPr) {
 
         case MODE_CONF_VIEW:
             // SEL: スクロール（0→1→0 循環）
-            if (selPr) g_confScrollPos = (g_confScrollPos + 1) % 2;
+            if (selPr) g_confScrollPos = (g_confScrollPos + 1) % 3;
             if (backPr || okPr) { g_confScrollPos = 0; g_uiMode = MODE_MENU; }
             break;
 
@@ -784,8 +784,8 @@ static void updateOLED() {
             uint32_t rbInt    = (bwIdx < 3 && sf >= 5 && sf <= 12)
                                 ? (uint32_t)((float)sf * CV_BW_HZ[bwIdx] / (1UL << sf) * 0.8f) : 0;
 
-            // ---- 8行コンテンツ生成 ----
-            char lines[8][22];
+            // ---- 9行コンテンツ生成 ----
+            char lines[9][22];
             snprintf(lines[0], 22, "addr:0x%02X%02X", g_e220.addH, g_e220.addL);
             snprintf(lines[1], 22, "CH:%d %.1fMHz", g_e220.channel, freq);
             snprintf(lines[2], 22, "UART:%sbps", CV_BAUD[baudBits < 8 ? baudBits : 0]);
@@ -797,9 +797,11 @@ static void updateOLED() {
                      rssiNoise ? "on" : "off", rssiApp ? "on" : "off");
             snprintf(lines[7], 22, "Mode:%s WOR:%sms",
                      fixedMode ? "Fixed" : "Trans", CV_WOR[worBits < 8 ? worBits : 6]);
+            snprintf(lines[8], 22, "R0:%02X R1:%02X R3:%02X",
+                     g_e220.reg0, g_e220.reg1, g_e220.reg3);
 
             // ---- 7行表示（スクロール位置から）+ ヒント ----
-            int8_t sp = (g_confScrollPos > 1) ? 1 : g_confScrollPos;
+            int8_t sp = (g_confScrollPos > 2) ? 2 : g_confScrollPos;
             for (int i = 0; i < 7; i++) {
                 g_oled.setCursor(0, i * 8);
                 g_oled.print(lines[sp + i]);
