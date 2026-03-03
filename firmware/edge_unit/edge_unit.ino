@@ -1,5 +1,5 @@
 /**
- * edge_unit.ino  –  Phase 2 Step4: SSD1306 + ボタンUI
+ * edge_unit.ino  –  Phase 2 Step4+5: SSD1306 + ボタンUI + ローカルテストモード
  *
  * 実装内容:
  *   - E220ドライバ（モード切替・設定読み取り・設定書き込み）
@@ -14,9 +14,10 @@
  *   - D1ハートビート: Core0+Core1の両方が生きているときのみ点滅
  *   - SSD1306 OLED表示（Wire1: GPIO26/27）
  *   - 3ボタンUI（デバウンス付き）: 設定確認・ADDH変更・CH変更
+ *   - Step5 ローカルテストモード: パトライト lux 表示 / 電流波形スナップショット + RMS 表示
  *
  * 未実装（後続Step）:
- *   - ローカルテストモード（Step5）
+ *   - Phase3/4: GW + Webアプリ統合
  *
  * E220 コンフィグモード(M0=HIGH,M1=HIGH)では UART は常に 9600bps 固定。
  * 通常動作モードでは DESIRED_REG0 に設定したボーレート（9600bps）を使用する。
@@ -37,6 +38,8 @@ enum UIMode : uint8_t {
     MODE_CONF_VIEW,
     MODE_EDIT_ADDH,
     MODE_EDIT_CHANNEL,
+    MODE_TEST_PATLITE,   // Step5: パトライトテスト（lux値表示）
+    MODE_TEST_CURRENT,   // Step5: 電流テスト（波形スナップショット + RMS）
 };
 
 // ===== ボタンデバウンス構造体（pollBtnプロトタイプより前に定義必須） =====
@@ -67,6 +70,9 @@ struct SharedData {
     float    current_rms;      // RMS電流値 [A]
     bool     sensor_error;     // センサー異常フラグ
     uint32_t core1_heartbeat;  // Core1生存確認カウンタ
+    // Step5: 電流波形スナップショット（テストモード用）
+    int16_t  wave_buf[128];    // 128サンプル（~128ms @ 1kHz）の生AC値
+    bool     wave_ready;       // true=128サンプル取得完了・描画可能
 };
 static SharedData g_shared = {};
 static mutex_t    g_mutex;
@@ -189,6 +195,13 @@ static uint32_t g_lastHbMs    = 0;
 static uint32_t g_d1FlashMs   = 0;  // D1点灯開始時刻（0=消灯中）
 static uint32_t g_d2FlashMs   = 0;  // D2点灯開始時刻（0=消灯中）
 static uint32_t g_lastCore1Hb = 0;
+
+// ===== Step5: 波形キャプチャ用グローバル =====
+static volatile bool g_wave_capture = false;   // Core0→Core1: キャプチャ指示フラグ
+// Core1プライベート（loop1からのみアクセス）
+static int16_t  s_wave_local[128]   = {};
+static bool     s_prev_capture      = false;
+static uint16_t s_wave_idx          = 0;
 
 // ===== Serial2 初期化ヘルパー =====
 static void serial2Begin(uint32_t baud) {
@@ -660,13 +673,21 @@ static void handleUI(bool selPr, bool okPr, bool backPr) {
             break;
 
         case MODE_MENU:
-            if (selPr) g_menuCursor = (g_menuCursor + 1) % 4;
+            if (selPr) g_menuCursor = (g_menuCursor + 1) % 6;
             if (okPr) {
                 switch (g_menuCursor) {
                     case 0: g_confScrollPos = 0; g_uiMode = MODE_CONF_VIEW; break;
                     case 1: g_editValue = g_e220.addH;    g_uiMode = MODE_EDIT_ADDH;    break;
                     case 2: g_editValue = g_e220.channel; g_uiMode = MODE_EDIT_CHANNEL; break;
-                    case 3: exitToNormal(); break;
+                    case 3: g_uiMode = MODE_TEST_PATLITE; break;
+                    case 4:
+                        mutex_enter_blocking(&g_mutex);
+                        g_shared.wave_ready = false;
+                        mutex_exit(&g_mutex);
+                        g_wave_capture = true;
+                        g_uiMode = MODE_TEST_CURRENT;
+                        break;
+                    case 5: exitToNormal(); break;
                 }
             }
             if (backPr) exitToNormal();
@@ -709,6 +730,38 @@ static void handleUI(bool selPr, bool okPr, bool backPr) {
                 g_uiMode = MODE_MENU;
             }
             break;
+
+        case MODE_TEST_PATLITE:
+            if (backPr || okPr) g_uiMode = MODE_MENU;
+            break;
+
+        case MODE_TEST_CURRENT:
+            if (selPr) {
+                // 新キャプチャ指示
+                mutex_enter_blocking(&g_mutex);
+                g_shared.wave_ready = false;
+                mutex_exit(&g_mutex);
+                g_wave_capture = true;
+            }
+            if (backPr || okPr) {
+                g_wave_capture = false;
+                g_uiMode = MODE_MENU;
+            }
+            break;
+    }
+}
+
+// ===== 波形描画ヘルパー（Step5: 電流テストモード用） =====
+// buf: 128サンプルのAC値（中心0、範囲±ADC_DC_OFFSET）
+// y_top/height: OLED上の描画領域
+static void drawWaveform(const int16_t *buf, int n, int y_top, int height) {
+    int center = y_top + height / 2;
+    int half   = height / 2;
+    for (int x = 0; x < n && x < OLED_W; x++) {
+        int y = center - (int32_t)buf[x] * half / ADC_DC_OFFSET;
+        if (y < y_top)           y = y_top;
+        if (y >= y_top + height) y = y_top + height - 1;
+        g_oled.drawPixel(x, y, SSD1306_WHITE);
     }
 }
 
@@ -747,18 +800,19 @@ static void updateOLED() {
             g_oled.setCursor(0, 56); g_oled.print("[OK]Menu");
             break;
 
-        case MODE_MENU:
-            g_oled.setCursor(0, 0);  g_oled.print("=== MENU ===");
-            {
-                static const char *items[] = {"Conf view", "Edit ADDH", "Edit Chan", "Exit"};
-                for (int i = 0; i < 4; i++) {
-                    snprintf(buf, sizeof(buf), "%c%s",
-                             (g_menuCursor == i) ? '>' : ' ', items[i]);
-                    g_oled.setCursor(0, 16 + i * 8);
-                    g_oled.print(buf);
-                }
+        case MODE_MENU: {
+            static const char *items[] = {
+                "Conf view", "Edit ADDH", "Edit Chan",
+                "Patlite tst", "Current tst", "Exit"
+            };
+            for (int i = 0; i < 6; i++) {
+                snprintf(buf, sizeof(buf), "%c%s",
+                         (g_menuCursor == i) ? '>' : ' ', items[i]);
+                g_oled.setCursor(0, i * 8);
+                g_oled.print(buf);
             }
             break;
+        }
 
         case MODE_CONF_VIEW: {
             // ---- レジスタデコード ----
@@ -830,6 +884,48 @@ static void updateOLED() {
             g_oled.setCursor(0, 40); g_oled.print("[S]+1 [BK]-1");
             g_oled.setCursor(0, 48); g_oled.print("[OK]save");
             break;
+
+        case MODE_TEST_PATLITE: {
+            // パトライトテスト: 3chのlux値をリアルタイム表示
+            float lux[3];
+            mutex_enter_blocking(&g_mutex);
+            lux[0] = g_shared.patlite_max[0];
+            lux[1] = g_shared.patlite_max[1];
+            lux[2] = g_shared.patlite_max[2];
+            mutex_exit(&g_mutex);
+            g_oled.setCursor(0, 0);  g_oled.print("--Patlite tst--");
+            snprintf(buf, sizeof(buf), "RED: %.1flux", lux[0]);
+            g_oled.setCursor(0, 16); g_oled.print(buf);
+            snprintf(buf, sizeof(buf), "YEL: %.1flux", lux[1]);
+            g_oled.setCursor(0, 24); g_oled.print(buf);
+            snprintf(buf, sizeof(buf), "GRN: %.1flux", lux[2]);
+            g_oled.setCursor(0, 32); g_oled.print(buf);
+            g_oled.setCursor(0, 56); g_oled.print("[BK]exit");
+            break;
+        }
+
+        case MODE_TEST_CURRENT: {
+            // 電流テスト: 波形スナップショット（上48px）+ RMS値 + 操作ヒント
+            int16_t wave[128];
+            bool    ready;
+            float   rms;
+            mutex_enter_blocking(&g_mutex);
+            ready = g_shared.wave_ready;
+            if (ready) memcpy(wave, g_shared.wave_buf, sizeof(wave));
+            rms = g_shared.current_rms;
+            mutex_exit(&g_mutex);
+
+            if (ready) {
+                drawWaveform(wave, 128, 0, 48);
+            } else {
+                g_oled.setCursor(0, 16); g_oled.print("Press [SEL] to");
+                g_oled.setCursor(0, 24); g_oled.print("capture waveform");
+            }
+            snprintf(buf, sizeof(buf), "RMS:%.2fA", rms);
+            g_oled.setCursor(0, 48); g_oled.print(buf);
+            g_oled.setCursor(0, 56); g_oled.print("[S]cap [BK]ret");
+            break;
+        }
     }
 
     g_oled.display();
@@ -1028,6 +1124,25 @@ void loop1() {
             g_current_sum_sq       = 0;
             g_current_count        = 0;
             g_current_window_start = millis();
+        }
+
+        // Step5: 波形キャプチャ（g_wave_capture フラグ監視）
+        if (g_wave_capture) {
+            if (!s_prev_capture) s_wave_idx = 0;  // 新キャプチャ開始: インデックスリセット
+            if (s_wave_idx < 128) {
+                s_wave_local[s_wave_idx++] = (int16_t)v_ac;
+                if (s_wave_idx >= 128) {
+                    // 128サンプル取得完了 → 共有バッファにコピーして完了通知
+                    mutex_enter_blocking(&g_mutex);
+                    memcpy(g_shared.wave_buf, s_wave_local, sizeof(s_wave_local));
+                    g_shared.wave_ready = true;
+                    mutex_exit(&g_mutex);
+                    g_wave_capture = false;
+                }
+            }
+            s_prev_capture = true;
+        } else {
+            s_prev_capture = false;
         }
 
         if (!did_heartbeat) {
