@@ -1046,7 +1046,7 @@ void loop() {
     // ---- D3 LED（メニュー/編集モード中は点灯） ----
     digitalWrite(PIN_LED_D3, g_uiMode != MODE_NORMAL ? HIGH : LOW);
 
-    // ---- D1 ハートビートパルス（5秒周期、Core0+Core1 両方が生きているときのみ） ----
+    // ---- D1 ハートビートパルス（5秒周期、通常モード時のみ・Core0+Core1 両方が生きているときのみ） ----
     uint32_t now = millis();
     if (now - g_lastHbMs >= D1_PERIOD_MS) {
         g_lastHbMs = now;
@@ -1058,15 +1058,16 @@ void loop() {
         mutex_exit(&g_mutex);
         bool core1_alive = (c1hb != g_lastCore1Hb);
         g_lastCore1Hb = c1hb;
-        if (core1_alive) {
+        // メンテ中（黄LED点灯時）は青ハートビートを点滅しない
+        if (core1_alive && g_uiMode == MODE_NORMAL) {
             g_d1FlashMs = now;
             digitalWrite(PIN_LED_D1, HIGH);
         }
         digitalWrite(PIN_LED_D4, sensor_err ? HIGH : LOW);
     }
 
-    // ---- D1 ハートビートパルス消灯 ----
-    if (g_d1FlashMs > 0 && (now - g_d1FlashMs >= D1_FLASH_MS)) {
+    // ---- D1 ハートビートパルス消灯（タイムアウト or メンテモード移行時に即消灯） ----
+    if (g_d1FlashMs > 0 && (now - g_d1FlashMs >= D1_FLASH_MS || g_uiMode != MODE_NORMAL)) {
         g_d1FlashMs = 0;
         digitalWrite(PIN_LED_D1, LOW);
     }
