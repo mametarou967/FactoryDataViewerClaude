@@ -184,8 +184,13 @@ static BtnState g_selState  = {true, 0};
 static BtnState g_okState   = {true, 0};
 static BtnState g_backState = {true, 0};
 
+// ===== 動的メニュー（ユニット種別に応じて buildMenu() で構築） =====
+struct MenuItem { const char *label; uint8_t action; };
+static MenuItem g_menuItems[6];
+static uint8_t  g_menuCount = 0;
+
 // ===== UI状態変数 =====
-static int8_t  g_menuCursor    = 0;   // 0=Conf, 1=ADDH, 2=Chan, 3=Exit
+static int8_t  g_menuCursor    = 0;
 static uint8_t g_editValue     = 0;   // 編集中の値
 static int8_t  g_confScrollPos = 0;   // ConfView スクロール位置（0〜1）
 static uint32_t g_lastOledMs   = 0;
@@ -665,6 +670,18 @@ static void exitToNormal() {
     while (Serial2.available()) Serial2.read();  // 旧コマンドを破棄
 }
 
+// ===== メニュー構築（ユニット種別に応じた項目のみ表示） =====
+// action番号: 0=ConfView 1=ADDH 2=Chan 3=PatliteTest 4=CurrentTest 5=Exit
+static void buildMenu() {
+    g_menuCount = 0;
+    g_menuItems[g_menuCount++] = {"Conf view",   0};
+    g_menuItems[g_menuCount++] = {"Edit ADDH",   1};
+    g_menuItems[g_menuCount++] = {"Edit Chan",   2};
+    if (g_unit_type & UNIT_PATLITE) g_menuItems[g_menuCount++] = {"Patlite tst", 3};
+    if (g_unit_type & UNIT_CURRENT) g_menuItems[g_menuCount++] = {"Current tst", 4};
+    g_menuItems[g_menuCount++] = {"Exit",         5};
+}
+
 // ===== UIハンドラ =====
 static void handleUI(bool selPr, bool okPr, bool backPr) {
     switch (g_uiMode) {
@@ -673,9 +690,9 @@ static void handleUI(bool selPr, bool okPr, bool backPr) {
             break;
 
         case MODE_MENU:
-            if (selPr) g_menuCursor = (g_menuCursor + 1) % 6;
+            if (selPr) g_menuCursor = (g_menuCursor + 1) % g_menuCount;
             if (okPr) {
-                switch (g_menuCursor) {
+                switch (g_menuItems[g_menuCursor].action) {
                     case 0: g_confScrollPos = 0; g_uiMode = MODE_CONF_VIEW; break;
                     case 1: g_editValue = g_e220.addH;    g_uiMode = MODE_EDIT_ADDH;    break;
                     case 2: g_editValue = g_e220.channel; g_uiMode = MODE_EDIT_CHANNEL; break;
@@ -801,13 +818,9 @@ static void updateOLED() {
             break;
 
         case MODE_MENU: {
-            static const char *items[] = {
-                "Conf view", "Edit ADDH", "Edit Chan",
-                "Patlite tst", "Current tst", "Exit"
-            };
-            for (int i = 0; i < 6; i++) {
+            for (int i = 0; i < g_menuCount; i++) {
                 snprintf(buf, sizeof(buf), "%c%s",
-                         (g_menuCursor == i) ? '>' : ' ', items[i]);
+                         (g_menuCursor == i) ? '>' : ' ', g_menuItems[i].label);
                 g_oled.setCursor(0, i * 8);
                 g_oled.print(buf);
             }
@@ -965,6 +978,7 @@ void setup() {
         (g_unit_type & UNIT_PATLITE) ? "patlite " : "",
         (g_unit_type & UNIT_CURRENT) ? "current"  : "",
         DESIRED_ADDL);
+    buildMenu();  // ユニット種別確定後にメニューを構築
 
     // ---- E220 モード制御ピン ----
     pinMode(PIN_LORA_M0,  OUTPUT);
