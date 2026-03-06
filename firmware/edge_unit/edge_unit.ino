@@ -960,6 +960,17 @@ void setup() {
     pinMode(PIN_LED_D3, OUTPUT); digitalWrite(PIN_LED_D3, LOW);
     pinMode(PIN_LED_D4, OUTPUT); digitalWrite(PIN_LED_D4, LOW);
 
+    // ---- SSD1306 早期初期化（DIPエラー表示のためLED init直後に行う） ----
+    Wire1.setSDA(PIN_I2C1_SDA);
+    Wire1.setSCL(PIN_I2C1_SCL);
+    Wire1.begin();
+    if (!g_oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println("SSD1306 not found");
+    }
+    g_oled.clearDisplay();
+    g_oled.display();
+    Serial.println("SSD1306 ready");
+
     // ---- ボタン・DIPスイッチ（プルアップ: LOW=ON） ----
     pinMode(PIN_BTN_SEL,  INPUT_PULLUP);
     pinMode(PIN_BTN_OK,   INPUT_PULLUP);
@@ -979,6 +990,23 @@ void setup() {
         (g_unit_type & UNIT_CURRENT) ? "current"  : "",
         DESIRED_ADDL);
     buildMenu();  // ユニット種別確定後にメニューを構築
+
+    // ---- DIP設定エラーチェック（DIP1/DIP2 両方OFFは不正） ----
+    if (g_unit_type == 0) {
+        Serial.println("[FATAL] DIP設定エラー: DIP1/DIP2 両方OFFは無効。DIP1(patlite)またはDIP2(current)を最低1つONにしてから再起動してください。");
+        digitalWrite(PIN_LED_D4, HIGH);
+        g_oled.clearDisplay();
+        g_oled.setTextSize(1);
+        g_oled.setTextColor(SSD1306_WHITE);
+        g_oled.setCursor(0,  0); g_oled.print("!! DIP ERROR !!");
+        g_oled.setCursor(0, 16); g_oled.print("DIP1 & DIP2");
+        g_oled.setCursor(0, 24); g_oled.print("both OFF: invalid");
+        g_oled.setCursor(0, 40); g_oled.print("DIP1=patlite");
+        g_oled.setCursor(0, 48); g_oled.print("DIP2=current");
+        g_oled.setCursor(0, 56); g_oled.print("-> reboot");
+        g_oled.display();
+        while (true) delay(1000);  // halt
+    }
 
     // ---- E220 モード制御ピン ----
     pinMode(PIN_LORA_M0,  OUTPUT);
@@ -1021,17 +1049,6 @@ void setup() {
         g_current_window_start = millis();
         Serial.println("  MCP3208 ready (CH0, VREF=3.3V)");
     }
-
-    // ---- SSD1306 初期化（Wire1: GPIO26/27） ----
-    Wire1.setSDA(PIN_I2C1_SDA);
-    Wire1.setSCL(PIN_I2C1_SCL);
-    Wire1.begin();
-    if (!g_oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        Serial.println("SSD1306 not found");
-    }
-    g_oled.clearDisplay();
-    g_oled.display();
-    Serial.println("SSD1306 ready");
 
     // ---- AUX割り込み有効化 ----
     attachInterrupt(digitalPinToInterrupt(PIN_LORA_AUX), onAuxRise, RISING);
