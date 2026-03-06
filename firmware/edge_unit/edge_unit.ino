@@ -175,6 +175,7 @@ static void onAuxRise() { g_auxRise = true; }
 
 // ===== SSD1306 OLEDオブジェクト =====
 static Adafruit_SSD1306 g_oled(OLED_W, OLED_H, &Wire1, -1);
+static bool g_oled_ok = false;  // OLED初期化成功フラグ（reportError内で参照）
 
 // ===== UI状態 =====
 static UIMode g_uiMode = MODE_NORMAL;
@@ -944,6 +945,41 @@ static void updateOLED() {
     g_oled.display();
 }
 
+// ===== エラー報告（3系統同時出力） =====
+// 優先度1: OLED不可 → Serial + D4のみ
+// 優先度2: DIP両OFF → Serial + D4 + OLED + halt
+// 優先度3: TSL2561失敗 → Serial + D4 + OLED（3秒表示後続行）
+// g_oled_ok=false の場合はOLED表示をスキップ
+// fatal=true の場合は表示後にhalt（再起動が必要）
+static void reportError(bool fatal, const char *serial_msg,
+                        const char *oled_title,
+                        const char *oled_l1,
+                        const char *oled_l2,
+                        const char *oled_l3) {
+    // 1. シリアル出力
+    Serial.printf("[%s] %s\n", fatal ? "FATAL" : "ERROR", serial_msg);
+
+    // 2. D4(赤)点灯
+    digitalWrite(PIN_LED_D4, HIGH);
+
+    // 3. OLED表示（初期化成功時のみ）
+    if (g_oled_ok) {
+        g_oled.clearDisplay();
+        g_oled.setTextSize(1);
+        g_oled.setTextColor(SSD1306_WHITE);
+        g_oled.setCursor(0,  0); g_oled.print(oled_title);
+        if (oled_l1) { g_oled.setCursor(0, 16); g_oled.print(oled_l1); }
+        if (oled_l2) { g_oled.setCursor(0, 24); g_oled.print(oled_l2); }
+        if (oled_l3) { g_oled.setCursor(0, 32); g_oled.print(oled_l3); }
+        g_oled.setCursor(0, 56);
+        g_oled.print(fatal ? "-> reboot" : "continuing...");
+        g_oled.display();
+        if (!fatal) delay(3000);  // 非致命的: 3秒表示してから続行
+    }
+
+    if (fatal) while (true) delay(1000);  // 致命的: halt
+}
+
 // ===== Setup =====
 void setup() {
     // ---- mutex は最初に初期化（Core1起動前に必須） ----
@@ -960,16 +996,22 @@ void setup() {
     pinMode(PIN_LED_D3, OUTPUT); digitalWrite(PIN_LED_D3, LOW);
     pinMode(PIN_LED_D4, OUTPUT); digitalWrite(PIN_LED_D4, LOW);
 
-    // ---- SSD1306 早期初期化（DIPエラー表示のためLED init直後に行う） ----
+    // ---- [優先度1] SSD1306 早期初期化（DIPエラー表示のためLED init直後に行う） ----
     Wire1.setSDA(PIN_I2C1_SDA);
     Wire1.setSCL(PIN_I2C1_SCL);
     Wire1.begin();
     if (!g_oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        Serial.println("SSD1306 not found");
+        // OLED不可: Serial + D4のみ（OLEDは使えないためreportErrorはSerial+D4のみ動作）
+        reportError(false,
+            "SSD1306通信不可: Wire1(GPIO26/27)の配線を確認してください",
+            nullptr, nullptr, nullptr, nullptr);
+        // g_oled_ok は false のまま。以降のエラー表示はSerial+D4のみ
+    } else {
+        g_oled_ok = true;
+        g_oled.clearDisplay();
+        g_oled.display();
+        Serial.println("SSD1306 ready");
     }
-    g_oled.clearDisplay();
-    g_oled.display();
-    Serial.println("SSD1306 ready");
 
     // ---- ボタン・DIPスイッチ（プルアップ: LOW=ON） ----
     pinMode(PIN_BTN_SEL,  INPUT_PULLUP);
@@ -991,21 +1033,14 @@ void setup() {
         DESIRED_ADDL);
     buildMenu();  // ユニット種別確定後にメニューを構築
 
-    // ---- DIP設定エラーチェック（DIP1/DIP2 両方OFFは不正） ----
+    // ---- [優先度2] DIP設定エラーチェック（DIP1/DIP2 両方OFFは不正・致命的） ----
     if (g_unit_type == 0) {
-        Serial.println("[FATAL] DIP設定エラー: DIP1/DIP2 両方OFFは無効。DIP1(patlite)またはDIP2(current)を最低1つONにしてから再起動してください。");
-        digitalWrite(PIN_LED_D4, HIGH);
-        g_oled.clearDisplay();
-        g_oled.setTextSize(1);
-        g_oled.setTextColor(SSD1306_WHITE);
-        g_oled.setCursor(0,  0); g_oled.print("!! DIP ERROR !!");
-        g_oled.setCursor(0, 16); g_oled.print("DIP1 & DIP2");
-        g_oled.setCursor(0, 24); g_oled.print("both OFF: invalid");
-        g_oled.setCursor(0, 40); g_oled.print("DIP1=patlite");
-        g_oled.setCursor(0, 48); g_oled.print("DIP2=current");
-        g_oled.setCursor(0, 56); g_oled.print("-> reboot");
-        g_oled.display();
-        while (true) delay(1000);  // halt
+        reportError(true,
+            "DIP設定エラー: DIP1/DIP2 両方OFFは無効。最低1つをONにして再起動",
+            "!! DIP ERROR !!",
+            "DIP1 & DIP2 both OFF",
+            "DIP1=patlite",
+            "DIP2=current");
     }
 
     // ---- E220 モード制御ピン ----
@@ -1035,6 +1070,26 @@ void setup() {
         Wire.begin();
         Serial.println("Init TSL2561 sensors...");
         initPatliteSensors();
+
+        // [優先度3] TSL2561初期化失敗チェック（非致命的: D4点灯 + OLED 3秒表示後続行）
+        bool se;
+        mutex_enter_blocking(&g_mutex);
+        se = g_shared.sensor_error;
+        mutex_exit(&g_mutex);
+        if (se) {
+            // 失敗チャンネルをシリアルに列挙
+            char detail[22];
+            snprintf(detail, sizeof(detail), "fail: CH%s%s%s",
+                     g_tsl_ok[0] ? "" : "0 ",
+                     g_tsl_ok[1] ? "" : "1 ",
+                     g_tsl_ok[2] ? "" : "2");
+            reportError(false,
+                "TSL2561初期化失敗: TCA9548AおよびTSL2561の配線を確認してください",
+                "!! SENSOR ERROR !!",
+                "TSL2561 init failed",
+                detail,
+                "Check TCA9548A/wiring");
+        }
     }
 
     // ---- 電流ユニット: SPI + MCP3208 初期化 ----
