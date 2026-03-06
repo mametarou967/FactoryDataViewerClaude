@@ -220,7 +220,15 @@ static void serial2Begin(uint32_t baud) {
 
 // ===== E220 モード切替 =====
 static void e220WaitAuxHigh() {
-    while (digitalRead(PIN_LORA_AUX) == LOW) delay(1);
+    uint32_t lastDot = millis();
+    while (digitalRead(PIN_LORA_AUX) == LOW) {
+        if (millis() - lastDot >= 500) {
+            Serial.print(".");
+            lastDot = millis();
+        }
+        delay(1);
+    }
+    Serial.println();  // ドット行を改行
 }
 
 static void e220SetNormalMode() {
