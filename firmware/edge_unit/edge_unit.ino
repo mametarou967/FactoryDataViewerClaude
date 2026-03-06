@@ -219,6 +219,20 @@ static void serial2Begin(uint32_t baud) {
 }
 
 // ===== E220 モード切替 =====
+// 起動時チェック用: タイムアウト付き（timeout_ms以内にHIGHにならなければfalseを返す）
+static bool e220WaitAuxHighTimeout(uint32_t timeout_ms) {
+    uint32_t start   = millis();
+    uint32_t lastDot = millis();
+    while (digitalRead(PIN_LORA_AUX) == LOW) {
+        if (millis() - start >= timeout_ms) { Serial.println(); return false; }
+        if (millis() - lastDot >= 500) { Serial.print("."); lastDot = millis(); }
+        delay(1);
+    }
+    Serial.println();
+    return true;
+}
+
+// モード切替用: 無限待ち（E220存在確認済み後に使用）
 static void e220WaitAuxHigh() {
     uint32_t lastDot = millis();
     while (digitalRead(PIN_LORA_AUX) == LOW) {
@@ -1069,16 +1083,24 @@ void setup() {
     // ---- Serial2 起動（通常動作モード: 9600bps） ----
     serial2Begin(9600);
 
-    // ---- E220初期化完了待ち（AUX=HIGH確認） ----
+    // ---- [優先度2.5] E220存在確認（AUX=HIGH タイムアウト3秒） ----
     Serial.println("Waiting for E220 init (AUX=HIGH)...");
     digitalWrite(PIN_LORA_M0, LOW);
     digitalWrite(PIN_LORA_M1, LOW);
     delay(100);
-    e220WaitAuxHigh();
-    Serial.println("E220 hardware ready");
-
-    // ---- E220 設定確認・必要なら書き込み ----
-    e220ConfigureIfNeeded();
+    bool e220_present = e220WaitAuxHighTimeout(3000);
+    if (!e220_present) {
+        reportError(false,
+            "E220未検出: AUX(GPIO6)がHIGHにならない。E220の接続・電源を確認してください",
+            "!! E220 ERROR !!",
+            "E220 not detected",
+            "Check E220 wiring",
+            "and power supply");
+    } else {
+        Serial.println("E220 hardware ready");
+        // ---- E220 設定確認・必要なら書き込み ----
+        e220ConfigureIfNeeded();
+    }
 
     // ---- パトライトユニット: I2C + TSL2561 初期化 ----
     if (g_unit_type & UNIT_PATLITE) {
