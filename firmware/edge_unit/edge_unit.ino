@@ -1000,12 +1000,22 @@ void setup() {
     Wire1.setSDA(PIN_I2C1_SDA);
     Wire1.setSCL(PIN_I2C1_SCL);
     Wire1.begin();
-    if (!g_oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-        // OLED不可: Serial + D4のみ（OLEDは使えないためreportErrorはSerial+D4のみ動作）
+    // I2Cアドレススキャンで物理的な接続を確認（beginTransmission+endTransmissionでACK/NACKを検出）
+    // endTransmission()戻り値: 0=ACK(接続あり), 2=NACK(接続なし/アドレス不一致)
+    Wire1.beginTransmission(OLED_ADDR);
+    uint8_t i2c_err = Wire1.endTransmission();
+    if (i2c_err != 0) {
+        // デバイス未接続: Serial + D4のみ（OLEDは使えない）
+        Serial.printf("Wire1 scan: addr=0x%02X err=%d (device not found)\n", OLED_ADDR, i2c_err);
         reportError(false,
             "SSD1306通信不可: Wire1(GPIO26/27)の配線を確認してください",
             nullptr, nullptr, nullptr, nullptr);
         // g_oled_ok は false のまま。以降のエラー表示はSerial+D4のみ
+    } else if (!g_oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        // ACKは返ったが初期化シーケンス失敗
+        reportError(false,
+            "SSD1306初期化失敗: デバイスは応答するが初期化できません",
+            nullptr, nullptr, nullptr, nullptr);
     } else {
         g_oled_ok = true;
         g_oled.clearDisplay();
