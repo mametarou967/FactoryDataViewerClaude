@@ -175,7 +175,11 @@ static void onAuxRise() { g_auxRise = true; }
 
 // ===== SSD1306 OLEDオブジェクト =====
 static Adafruit_SSD1306 g_oled(OLED_W, OLED_H, &Wire1, -1);
-static bool g_oled_ok = false;  // OLED初期化成功フラグ（reportError内で参照）
+static bool g_oled_ok   = false;  // OLED初期化成功フラグ（reportError内で参照）
+static bool g_hw_error  = false;  // ハードウェアエラーフラグ（reportError()で設定、再起動まで維持）
+// エラー内容をOLEDに継続表示するための文字列（updateOLED()で使用）
+static char g_hw_err_title[21] = "";
+static char g_hw_err_line1[21] = "";
 
 // ===== UI状態 =====
 static UIMode g_uiMode = MODE_NORMAL;
@@ -410,12 +414,23 @@ static void updatePatliteMax(uint8_t ch, float lux) {
 }
 
 // ===== TSL2561 初期化（setup()内のCore0から呼ぶ） =====
+// USB差し込み時は電源立ち上がりが遅くタイミングによって初期化に失敗することがある。
+// 各チャンネルを最大3回リトライして確実に初期化する。
 static void initPatliteSensors() {
     bool any_error = false;
     for (uint8_t ch = 0; ch < 3; ch++) {
-        tcaSelect(ch);
-        delay(2);
-        if (!g_tsl[ch]->begin()) {
+        bool ok = false;
+        for (int retry = 0; retry < 3 && !ok; retry++) {
+            tcaSelect(ch);
+            delay(10);  // TCAチャンネル切替安定待ち（旧2ms→10ms）
+            if (g_tsl[ch]->begin()) {
+                ok = true;
+            } else if (retry < 2) {
+                Serial.printf("  [RETRY %d] TSL2561 CH%d...\n", retry + 1, ch);
+                delay(20);
+            }
+        }
+        if (!ok) {
             Serial.printf("  [ERROR] TSL2561 not found on TCA CH%d\n", ch);
             g_tsl_ok[ch] = false;
             any_error = true;
@@ -429,7 +444,8 @@ static void initPatliteSensors() {
     mutex_enter_blocking(&g_mutex);
     g_shared.sensor_error = any_error;
     mutex_exit(&g_mutex);
-    if (any_error) digitalWrite(PIN_LED_D4, HIGH);
+    // D4点灯はreportError()経由（g_hw_errorを設定）ではなく、
+    // ここでは直接点灯しない。呼び出し元のsetup()でreportError()を呼ぶ。
 }
 
 // ===== MCP3208 raw読み取り（single-ended） =====
@@ -445,6 +461,7 @@ static uint16_t readMCP3208_raw(uint8_t ch) {
     SPI.endTransaction();
     return (uint16_t)((hi & 0x0F) << 8) | lo;  // 12bit結果
 }
+
 
 // ===== コマンドハンドラ =====
 
@@ -817,6 +834,17 @@ static void updateOLED() {
 
     char buf[24];
 
+    // HWエラー中（E220未接続・DIPエラー等）は通常画面に戻らずエラー表示を維持
+    // メニュー操作中はメニュー表示を優先（ユーザーが意図的に操作している）
+    if (g_hw_error && g_uiMode == MODE_NORMAL) {
+        g_oled.setCursor(0,  0); g_oled.print(g_hw_err_title);
+        g_oled.setCursor(0, 16); g_oled.print(g_hw_err_line1);
+        g_oled.setCursor(0, 48); g_oled.print("D4:red=HW error");
+        g_oled.setCursor(0, 56); g_oled.print("-> reboot needed");
+        g_oled.display();
+        return;
+    }
+
     switch (g_uiMode) {
         case MODE_NORMAL:
             // line0: アドレス
@@ -981,8 +1009,15 @@ static void reportError(bool fatal, const char *serial_msg,
     // 1. シリアル出力
     Serial.printf("[%s] %s\n", fatal ? "FATAL" : "ERROR", serial_msg);
 
-    // 2. D4(赤)点灯
+    // 2. D4(赤)点灯 + hw_errorフラグ設定
+    // （loop()のハートビートブロックがsensor_errのみで判定するため、
+    //   別フラグで保持しないと5秒後に消灯されてしまう）
+    g_hw_error = true;
     digitalWrite(PIN_LED_D4, HIGH);
+    // updateOLED()でエラー表示を継続するためにメッセージを保存
+    if (oled_title) strncpy(g_hw_err_title, oled_title, sizeof(g_hw_err_title) - 1);
+    else            strncpy(g_hw_err_title, "!! HW ERROR !!",  sizeof(g_hw_err_title) - 1);
+    if (oled_l1)    strncpy(g_hw_err_line1, oled_l1,   sizeof(g_hw_err_line1) - 1);
 
     // 3. OLED表示（初期化成功時のみ）
     if (g_oled_ok) {
@@ -1078,7 +1113,10 @@ void setup() {
     // ---- E220 モード制御ピン ----
     pinMode(PIN_LORA_M0,  OUTPUT);
     pinMode(PIN_LORA_M1,  OUTPUT);
-    pinMode(PIN_LORA_AUX, INPUT);
+    // AUXはE220側がオープンドレイン出力: 未接続時に浮遊しないようPULLDOWNを使用
+    // E220接続時: idle=HIGH（E220がプル）/ busy=LOW（E220がLOWに引く）
+    // E220未接続時: 常にLOW（PULLDOWN）→ e220WaitAuxHighTimeout が確実にタイムアウト
+    pinMode(PIN_LORA_AUX, INPUT_PULLDOWN);
 
     // ---- Serial2 起動（通常動作モード: 9600bps） ----
     serial2Begin(9600);
@@ -1184,12 +1222,14 @@ void loop() {
         mutex_exit(&g_mutex);
         bool core1_alive = (c1hb != g_lastCore1Hb);
         g_lastCore1Hb = c1hb;
-        // メンテ中（黄LED点灯時）は青ハートビートを点滅しない
-        if (core1_alive && g_uiMode == MODE_NORMAL) {
+        // メンテ中（黄LED点灯時）またはHWエラー中は青ハートビートを点滅しない
+        // g_hw_error中に青が点滅すると「正常動作」に見えてしまうため抑制
+        if (core1_alive && g_uiMode == MODE_NORMAL && !g_hw_error) {
             g_d1FlashMs = now;
             digitalWrite(PIN_LED_D1, HIGH);
         }
-        digitalWrite(PIN_LED_D4, sensor_err ? HIGH : LOW);
+        // g_hw_error: OLED/E220/DIP等のハードウェアエラーはrebootまで点灯維持
+        digitalWrite(PIN_LED_D4, (sensor_err || g_hw_error) ? HIGH : LOW);
     }
 
     // ---- D1 ハートビートパルス消灯（タイムアウト or メンテモード移行時に即消灯） ----
