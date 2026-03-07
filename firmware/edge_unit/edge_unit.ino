@@ -82,7 +82,8 @@ static Adafruit_TSL2561_Unified g_tsl0(TSL2561_ADDR_FLOAT, 1000);
 static Adafruit_TSL2561_Unified g_tsl1(TSL2561_ADDR_FLOAT, 1001);
 static Adafruit_TSL2561_Unified g_tsl2(TSL2561_ADDR_FLOAT, 1002);
 static Adafruit_TSL2561_Unified *g_tsl[3] = {&g_tsl0, &g_tsl1, &g_tsl2};
-static bool g_tsl_ok[3] = {};
+static volatile bool g_tsl_ok[3]    = {};
+static volatile bool g_setup_done   = false;  // Core0のsetup()完了フラグ（Core1がloop1()開始前に待つ）
 
 // ===== 1.5秒maxウィンドウ（Core1ローカル） =====
 static const uint32_t PATLITE_WINDOW_MS = 1500;
@@ -964,6 +965,9 @@ static void updateOLED() {
             g_oled.setCursor(0, 24); g_oled.print(buf);
             snprintf(buf, sizeof(buf), "GRN: %.1flux", lux[2]);
             g_oled.setCursor(0, 32); g_oled.print(buf);
+            snprintf(buf, sizeof(buf), "ok:%c%c%c",
+                     g_tsl_ok[0]?'Y':'N', g_tsl_ok[1]?'Y':'N', g_tsl_ok[2]?'Y':'N');
+            g_oled.setCursor(0, 40); g_oled.print(buf);
             g_oled.setCursor(0, 56); g_oled.print("[BK]exit");
             break;
         }
@@ -1186,6 +1190,9 @@ void setup() {
     // ---- AUX割り込み有効化 ----
     attachInterrupt(digitalPinToInterrupt(PIN_LORA_AUX), onAuxRise, RISING);
 
+    // ---- Core1 loop1()開始を許可 ----
+    g_setup_done = true;
+
     Serial.println("=== Ready. Waiting for GW commands. ===");
 }
 
@@ -1250,7 +1257,12 @@ void loop() {
 
 // ===== Core1 =====
 // Wire/センサーはCore0のsetup()で初期化済み。Core1はWireを排他的に使用する。
-void setup1() {}
+void setup1() {
+    // Core0のsetup()完了を待ってからloop1()を開始する。
+    // arduino-picoはCore0のsetup()より前にCore1を起動するため、
+    // g_tsl_ok[]等の共有変数をCore0が初期化し終わるまで待つ必要がある。
+    while (!g_setup_done) delay(1);
+}
 
 void loop1() {
     bool did_heartbeat = false;

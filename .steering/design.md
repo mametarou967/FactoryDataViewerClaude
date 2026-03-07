@@ -309,7 +309,9 @@ if (g_d1FlashMs > 0 && (now - g_d1FlashMs >= D1_FLASH_MS)) {
 - Core1フリーズ → カウンタ不変 → D1ピカッ停止
 - 両方正常 → D1が5秒周期で100msピカッと点滅（青）
 - **注意**: Wire / Wire1 / SPI は必ずCore0の `setup()` 内で初期化すること
-  （arduino-picoでは `setup1()` は `setup()` 完了後に起動されるため安全）
+  （arduino-picoは Core1 を Core0 の `setup()` より「前に」起動するため、`setup1()` 内で
+  `volatile bool g_setup_done` フラグが true になるまでスピンウェイトし、
+  Core0の `setup()` 完了後に `loop1()` が始まるよう同期している）
 
 ### ローカルテストモードのセンサー表示
 - **通常動作時**: Core1が常時サンプリング → shared_dataにmax/RMSを更新し続ける
