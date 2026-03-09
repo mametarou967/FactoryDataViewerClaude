@@ -91,9 +91,9 @@ static float    g_patlite_local_max[3]  = {};
 static uint32_t g_patlite_expire_ms[3]  = {};
 
 // ===== MCP3208 電流計測 =====
-// 回路: CTL-24-CLS → R1(100Ω) → 計測点 (DCバイアス1.65V) → MCP3208 CH0
-// 変換: Io(Arms) = Vac_rms(V) × 20   ※ n/RL = 2000/100 = 20, K≈1 (Io≥10A)
-// クリップ: ~23A でADC飽和（22A超の検知用途には問題なし）
+// 回路: CTL-24-CLS → R1(33Ω) → 計測点 (DCバイアス1.65V) → MCP3208 CH0
+// 変換: Io(Arms) = Vac_rms(V) × (2000/33) ≈ 60.6   ※ n/RL = 2000/33, K≈1 (Io≥10A)
+// 最大安全電流: ~100A ピーク（ADC入力: 1.65±1.49V, 3.3V以内）
 static const uint8_t  PIN_SPI_MISO      = 16;
 static const uint8_t  PIN_SPI_CS        = 17;
 static const uint8_t  PIN_SPI_SCK       = 18;
@@ -101,6 +101,9 @@ static const uint8_t  PIN_SPI_MOSI      = 19;
 static const uint8_t  ADC_CURRENT_CH    = 0;      // MCP3208 CH0
 static const int32_t  ADC_DC_OFFSET     = 2048;   // 1.65V / 3.3V × 4096
 static const uint32_t CURRENT_WINDOW_MS = 100;    // RMSウィンドウ（50Hzで5周期）
+// ノイズフロア補正値 [Arms]: 電線未接続(0A)状態で実測した値を設定する。
+// 補正式: I_real = sqrt(I_meas^2 - N^2)。0.0fで補正無効。
+static const float    CURRENT_NOISE_FLOOR_A = 0.0f;
 
 // 電流計測（Core1ローカル）
 static int64_t  g_current_sum_sq       = 0;
@@ -1295,7 +1298,16 @@ void loop1() {
         if (millis() - g_current_window_start >= CURRENT_WINDOW_MS) {
             if (g_current_count > 0) {
                 float rms_counts  = sqrtf((float)g_current_sum_sq / (float)g_current_count);
-                float current_rms = rms_counts * (3.3f / 4096.0f) * 20.0f;   // 2000/100Ω
+                float current_rms = rms_counts * (3.3f / 4096.0f) * (2000.0f / 33.0f);  // n/RL=2000/33
+                // ノイズフロア補正: I_real = sqrt(I_meas^2 - N^2)
+                if (CURRENT_NOISE_FLOOR_A > 0.0f) {
+                    if (current_rms > CURRENT_NOISE_FLOOR_A) {
+                        current_rms = sqrtf(current_rms * current_rms
+                                            - CURRENT_NOISE_FLOOR_A * CURRENT_NOISE_FLOOR_A);
+                    } else {
+                        current_rms = 0.0f;
+                    }
+                }
                 mutex_enter_blocking(&g_mutex);
                 g_shared.current_rms = current_rms;
                 mutex_exit(&g_mutex);
