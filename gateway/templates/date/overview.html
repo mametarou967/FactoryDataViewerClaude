@@ -51,9 +51,9 @@
             </table>
           </div>
           <div class="mini" style="margin-top:6px;">
-            <a href="/date/{{ date }}/hinmoku/{{ item.index }}">この品目のグラフ</a> ／
-            <a href="/date/{{ date }}/hinmoku/{{ item.index }}/summary">稼働時間集計</a> ／
-            <a href="/date/{{ date }}/hinmoku/{{ item.index }}/info">本日分の手配情報</a>
+            <a href="/machine/{{ machine_name }}/date/{{ date }}/hinmoku/{{ item.index }}">この品目のグラフ</a> ／
+            <a href="/machine/{{ machine_name }}/date/{{ date }}/hinmoku/{{ item.index }}/summary">稼働時間集計</a> ／
+            <a href="/machine/{{ machine_name }}/date/{{ date }}/hinmoku/{{ item.index }}/info">本日分の手配情報</a>
           </div>
         {% endif %}
       </div>
@@ -76,7 +76,7 @@
       <!-- 3列目：グラフ（画像→リンク化） -->
       <div class="card imgwrap">
         {% if item.image_filename %}
-          {% set href = "/date/" ~ date ~ ("/graph" if item.kind == "day" else "/hinmoku/" ~ item.index) %}
+          {% set href = "/machine/" ~ machine_name ~ "/date/" ~ date ~ ("/graph" if item.kind == "day" else "/hinmoku/" ~ item.index) %}
           <a href="{{ href }}" title="{% if item.kind == 'day' %}日別グラフへ{% else %}品目#{{ item.index }}のグラフへ{% endif %}">
             <img src="/static/{{ item.image_filename }}"
                  alt="{% if item.kind == 'day' %}日別グラフ{% else %}品目#{{ item.index }} グラフ{% endif %}">

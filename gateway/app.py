@@ -1,7 +1,24 @@
-from flask import Flask, render_template, abort, send_file
+from flask import Flask, render_template, abort, send_file, redirect, url_for
 import csv
 import os
 from datetime import datetime, timedelta, time
+import time as _time
+import threading
+import queue
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+    print("[config] pyyaml がインストールされていません。config.yaml は読み込まれません。")
+
+try:
+    import serial
+    HAS_SERIAL = True
+except ImportError:
+    HAS_SERIAL = False
+    print("[E220] pyserial がインストールされていません。ポーリングを無効化します。")
 
 import matplotlib
 matplotlib.use('Agg')
@@ -13,9 +30,9 @@ from calendar import monthrange
 
 app = Flask(__name__)
 DATA_DIR = "data/sensor"
-HINMOKU_SUBDIR = "../hinmoku"  # 品目CSVのサブディレクトリ名（data/hinmoku/）
+HINMOKU_DIR = "data/hinmoku"
 
-# 点灯/消灯の閾値
+# デフォルト閾値（config.yaml の機械設定で上書き可）
 THRESHOLDS = {
     "red": 200,
     "yellow": 200,
@@ -23,23 +40,199 @@ THRESHOLDS = {
 }
 CURRENT_THRESHOLD = 3.0
 
-# 点灯・状態判定
-def get_light_status(red, yellow, green, current):
+
+# ===== 設定ロード =====
+
+def _parse_addr(v):
+    """YAMLが整数またはhex文字列のどちらで返してもアドレスを正しく解釈する。
+    yaml.safe_load は 0x0101 を int(257) として読むため、すでに int の場合はそのまま使う。
+    """
+    if isinstance(v, int):
+        return v
+    return int(str(v), 16)
+
+
+def load_config(path=None):
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+    if not HAS_YAML or not os.path.exists(path):
+        return {
+            'serial_port': '/dev/ttyUSB0',
+            'serial_baud': 9600,
+            'gw_channel': 2,
+            'gw_addr': 0x0000,
+            'poll_interval_sec': 60,
+            'machines': []
+        }
+    try:
+        with open(path) as f:
+            cfg = yaml.safe_load(f)
+        for m in cfg.get('machines', []):
+            m['patlite_addr'] = _parse_addr(m['patlite_addr'])
+            m['current_addr']  = _parse_addr(m['current_addr'])
+        cfg['gw_addr'] = _parse_addr(cfg['gw_addr'])
+        return cfg
+    except Exception as e:
+        print(f"[config] 設定ファイル読み込みエラー: {e}")
+        return {
+            'serial_port': '/dev/ttyUSB0',
+            'serial_baud': 9600,
+            'gw_channel': 2,
+            'gw_addr': 0x0000,
+            'poll_interval_sec': 60,
+            'machines': []
+        }
+
+
+config = load_config()
+
+
+# ===== E220ドライバ =====
+
+def e220_send(ser, dest_addr, channel, cmd_char):
+    pkt = bytes([(dest_addr >> 8) & 0xFF, dest_addr & 0xFF,
+                 channel, ord(cmd_char), 0x0D, 0x0A])
+    ser.reset_input_buffer()
+    ser.write(pkt)
+
+
+def e220_recv(ser, timeout_sec=2.5):
+    deadline = _time.time() + timeout_sec
+    buf = bytearray()
+    while _time.time() < deadline:
+        if ser.in_waiting:
+            buf += ser.read(ser.in_waiting)
+            if len(buf) >= 3 and buf[-2] == 0x0D and buf[-1] == 0x0A:
+                return bytes(buf)
+        _time.sleep(0.005)
+    return None
+
+
+def parse_patlite(data):
+    # [ADDR_H][ADDR_L]['P'][R_H][R_L][Y_H][Y_L][G_H][G_L][CR][LF]
+    if data and len(data) >= 9 and data[2] == ord('P'):
+        return (
+            (data[3] << 8) | data[4],
+            (data[5] << 8) | data[6],
+            (data[7] << 8) | data[8]
+        )
+    return None
+
+
+def parse_current(data):
+    # [ADDR_H][ADDR_L]['C'][CUR_H][CUR_L][CR][LF]
+    if data and len(data) >= 5 and data[2] == ord('C'):
+        return ((data[3] << 8) | data[4]) / 100.0
+    return None
+
+
+# ===== CSV書き込み =====
+
+def write_sensor_csv(machine_name, red, yellow, green, current):
+    now  = datetime.now()
+    dirp = os.path.join(DATA_DIR, machine_name)
+    os.makedirs(dirp, exist_ok=True)
+    path = os.path.join(dirp, f"{now.strftime('%Y-%m-%d')}.csv")
+    with open(path, 'a', newline='', encoding='utf-8') as f:
+        csv.writer(f).writerow([now.strftime('%H:%M:%S'), red, yellow, green, current])
+
+
+# ===== ポーリングスレッド =====
+
+g_cmd_q = queue.Queue()
+
+
+def poll_machine(ser, machine):
+    ch = config['gw_channel']
+    red = yellow = green = current = None
+    e220_send(ser, machine['patlite_addr'], ch, 'P')
+    lux = parse_patlite(e220_recv(ser))
+    if lux:
+        red, yellow, green = lux
+    e220_send(ser, machine['current_addr'], ch, 'C')
+    amp = parse_current(e220_recv(ser))
+    if amp is not None:
+        current = amp
+    write_sensor_csv(machine['name'],
+                     red or 0.0, yellow or 0.0,
+                     green or 0.0, current or 0.0)
+
+
+def _handle_maint(ser, req):
+    pass  # Step3で実装
+
+
+def polling_loop():
+    if not HAS_SERIAL:
+        print("[E220] pyserial がインストールされていません。ポーリングを無効化します。")
+        return
+    if not config.get('machines'):
+        print("[E220] machines が設定されていません。ポーリングを無効化します。")
+        return
+    while True:
+        try:
+            with serial.Serial(config['serial_port'],
+                               config['serial_baud'], timeout=0.1) as ser:
+                print(f"[E220] {config['serial_port']} 接続")
+                while True:
+                    t0 = _time.time()
+                    try:
+                        _handle_maint(ser, g_cmd_q.get_nowait())
+                    except queue.Empty:
+                        pass
+                    for machine in config['machines']:
+                        try:
+                            poll_machine(ser, machine)
+                        except Exception as e:
+                            print(f"[E220] poll_machine({machine['name']}) エラー: {e}")
+                    _time.sleep(max(0, config['poll_interval_sec'] - (_time.time() - t0)))
+        except Exception as e:
+            print(f"[E220] {e}  5秒後に再接続…")
+            _time.sleep(5)
+
+
+threading.Thread(target=polling_loop, daemon=True).start()
+
+
+# ===== 機械設定ヘルパー =====
+
+def _get_machine_or_404(machine_name):
+    for m in config['machines']:
+        if m['name'] == machine_name:
+            return m
+    abort(404, description=f"機械 '{machine_name}' が見つかりません。")
+
+
+def _first_machine_name():
+    """後方互換リダイレクト用の最初の機械名"""
+    if config['machines']:
+        return config['machines'][0]['name']
+    return 'default'
+
+
+# ===== 点灯・状態判定 =====
+
+def get_light_status(red, yellow, green, current,
+                     thresholds=None, current_threshold=None):
+    if thresholds is None:
+        thresholds = THRESHOLDS
+    if current_threshold is None:
+        current_threshold = CURRENT_THRESHOLD
+
     def is_on(color, value):
-        return value >= THRESHOLDS[color]
+        return value >= thresholds[color]
 
     status = {
-        "red": "点灯" if is_on("red", red) else "消灯",
+        "red":    "点灯" if is_on("red",    red)    else "消灯",
         "yellow": "点灯" if is_on("yellow", yellow) else "消灯",
-        "green": "点灯" if is_on("green", green) else "消灯"
+        "green":  "点灯" if is_on("green",  green)  else "消灯"
     }
 
-    machine_action = "加工中" if current >= CURRENT_THRESHOLD else "加工なし"
+    machine_action = "加工中" if current >= current_threshold else "加工なし"
 
-    # 状態判定
-    state, color = "停止", "gray"  # 色なし
+    state, color = "停止", "gray"
     r, y, g, m = status["red"], status["yellow"], status["green"], machine_action
-    
+
     if r == "消灯" and y == "消灯" and g == "消灯" and m == "加工なし":
         state, color = "停止", "gray"
     elif r == "消灯" and y == "消灯" and g == "点灯" and m == "加工なし":
@@ -75,53 +268,57 @@ def get_light_status(red, yellow, green, current):
 
     return status, machine_action, state, color
 
-# 最新データ取得
-def get_latest_data():
+
+# ===== 最新データ取得 =====
+
+def get_latest_data(machine_name):
+    dirpath = os.path.join(DATA_DIR, machine_name)
+    if not os.path.isdir(dirpath):
+        return None
     now = datetime.now()
     threshold = now - timedelta(minutes=5)
-    latest_row = None
-
-    for filename in sorted(os.listdir(DATA_DIR), reverse=True):
+    for filename in sorted(os.listdir(dirpath), reverse=True):
         if not filename.endswith(".csv"):
             continue
-        filepath = os.path.join(DATA_DIR, filename)
+        filepath = os.path.join(dirpath, filename)
         with open(filepath, newline='', encoding='utf-8') as f:
             reader = csv.reader(f)
             for row in reversed(list(reader)):
                 try:
-                    row_time = datetime.strptime(f"{filename[:-4]} {row[0]}", "%Y-%m-%d %H:%M:%S")
-                except:
+                    row_time = datetime.strptime(
+                        f"{filename[:-4]} {row[0]}", "%Y-%m-%d %H:%M:%S")
+                except Exception:
                     continue
                 if threshold <= row_time <= now:
                     return {
-                        "time": row[0],
-                        "red": float(row[1]),
-                        "yellow": float(row[2]),
-                        "green": float(row[3]),
-                        "current": float(row[4]),
+                        "time":      row[0],
+                        "red":       float(row[1]),
+                        "yellow":    float(row[2]),
+                        "green":     float(row[3]),
+                        "current":   float(row[4]),
                         "timestamp": row_time.strftime("%Y-%m-%d %H:%M:%S")
                     }
     return None
 
-def read_hinmoku_csv(date_str):
+
+def read_hinmoku_csv(date_str, hinmoku_prefix=None):
     """
-    品目CSV: data/hinmoku/A214_YYYYMMDD_.csv を読み、(headers, rows) を返す。
-    rows は 1行=リスト。1行目は見出し。
+    品目CSV: data/hinmoku/<prefix>_YYYYMMDD.csv を読み、(headers, rows, filename) を返す。
+    hinmoku_prefix が None のときは "A214" を使う（後方互換）。
     文字コードは cp932 優先、失敗時に utf-8 にフォールバック。
     """
+    if hinmoku_prefix is None:
+        hinmoku_prefix = "A214"
     yyyymmdd = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y%m%d")
-    expected_name = f"A214_{yyyymmdd}.csv"
-    dirpath = os.path.join(DATA_DIR, HINMOKU_SUBDIR)
+    expected_name = f"{hinmoku_prefix}_{yyyymmdd}.csv"
+    dirpath  = HINMOKU_DIR
     filepath = os.path.join(dirpath, expected_name)
 
     if not os.path.isdir(dirpath) or not os.path.exists(filepath):
-        return None, None, expected_name  # 見つからない
+        return None, None, expected_name
 
     rows = []
-    # cp932 -> utf-8 の順でトライ
-    tried_encodings = ["cp932", "utf-8"]
-    last_err = None
-    for enc in tried_encodings:
+    for enc in ["cp932", "utf-8"]:
         try:
             with open(filepath, newline="", encoding=enc) as f:
                 reader = csv.reader(f)
@@ -129,18 +326,17 @@ def read_hinmoku_csv(date_str):
                     if row:
                         rows.append(row)
             break
-        except Exception as e:
+        except Exception:
             rows = []
-            last_err = e
             continue
 
     if not rows:
-        # 空 or 読めない
         return None, None, expected_name
 
     headers = rows[0]
     records = rows[1:]
     return headers, records, expected_name
+
 
 def set_japanese_font():
     """日本語フォント設定（存在すれば適用）"""
@@ -156,19 +352,16 @@ def _day_range(date_str):
     return start, end
 
 
-def _load_minute_colors(date_str, start_dt=None, end_dt=None, include_gray=True):
+def _load_minute_colors(date_str, machine_name, start_dt=None, end_dt=None,
+                        include_gray=True, thresholds=None, current_threshold=None):
     """
-    data/<date_str>.csv を読み、分単位の色辞書 {datetime: color} を返す。
-    start_dt/end_dt が指定されれば [start_dt, end_dt) にクリップして格納。
-    include_gray=False の場合は 'gray' を除外。
+    data/sensor/<machine_name>/<date_str>.csv を読み、分単位の色辞書 {datetime: color} を返す。
     """
-    csv_path = os.path.join(DATA_DIR, f"{date_str}.csv")
+    csv_path = os.path.join(DATA_DIR, machine_name, f"{date_str}.csv")
     if not os.path.exists(csv_path):
-        return None  # データなし
+        return None
 
     day_start, day_end = _day_range(date_str)
-
-    # クリップ（無指定なら一日分）
     s = max(start_dt, day_start) if start_dt else day_start
     e = min(end_dt,   day_end)   if end_dt   else day_end
 
@@ -181,15 +374,14 @@ def _load_minute_colors(date_str, start_dt=None, end_dt=None, include_gray=True)
                 t = datetime.strptime(date_str + " " + row[0], "%Y-%m-%d %H:%M:%S")
             except Exception:
                 continue
-
-            # クリップ範囲外は無視
             if not (s <= t < e):
                 continue
-
             try:
                 r, y, g, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-                _, _, _, color = get_light_status(r, y, g, c)
-                if (color == "gray") and (not include_gray):
+                _, _, _, color = get_light_status(r, y, g, c,
+                                                  thresholds=thresholds,
+                                                  current_threshold=current_threshold)
+                if color == "gray" and not include_gray:
                     continue
                 minute_color[t] = color
             except Exception:
@@ -199,9 +391,7 @@ def _load_minute_colors(date_str, start_dt=None, end_dt=None, include_gray=True)
 
 
 def _render_day_timeline(date_str, minute_color, out_png_path, title):
-    """
-    1日横棒を描画。minute_color に入っている分だけ色を塗る。
-    """
+    """1日横棒を描画。minute_color に入っている分だけ色を塗る。"""
     set_japanese_font()
     day_start, day_end = _day_range(date_str)
 
@@ -214,7 +404,6 @@ def _render_day_timeline(date_str, minute_color, out_png_path, title):
             plt.barh(0, 60, left=left, height=0.5, color=color)
         current += timedelta(minutes=1)
 
-    # 目盛り（毎時）
     xticks, xticklabels = [], []
     hour = day_start
     while hour <= day_end:
@@ -237,83 +426,78 @@ def _render_day_timeline(date_str, minute_color, out_png_path, title):
 
 def generate_graph_image_unified(
     date_str,
+    machine_name,
     start_dt=None,
     end_dt=None,
     out_png_path=None,
     include_gray=True,
     skip_if_up_to_date=True,
+    thresholds=None,
+    current_threshold=None,
 ):
     """
     1本化された描画関数。
     - 日全体: start_dt/end_dt を渡さない
     - 区間のみ: start_dt/end_dt を渡す（[start_dt, end_dt)）
     - out_png_path 未指定時はデイリーの既定パスを使う
-    - デイリーはCSVが新しければ再描画、最新ならスキップ（skip_if_up_to_date=True）
     """
-    csv_path = os.path.join(DATA_DIR, f"{date_str}.csv")
+    csv_path = os.path.join(DATA_DIR, machine_name, f"{date_str}.csv")
     if not os.path.exists(csv_path):
         return False
 
-    # 既定の出力先
     if out_png_path is None:
-        image_filename = f"{date_str}_graph.png"
+        image_filename = f"{machine_name}_{date_str}_graph.png"
         out_png_path = os.path.join("static", image_filename)
 
-    # 「日全体」かつ「最新ならスキップ」だけ最適化
     is_full_day = (start_dt is None and end_dt is None)
     if skip_if_up_to_date and is_full_day and os.path.exists(out_png_path):
         if os.path.getmtime(csv_path) <= os.path.getmtime(out_png_path):
-            return True  # 画像が最新
+            return True
 
-    # 分ごとの色割り当てを取得
     minute_color = _load_minute_colors(
-        date_str,
-        start_dt=start_dt,
-        end_dt=end_dt,
-        include_gray=include_gray
+        date_str, machine_name,
+        start_dt=start_dt, end_dt=end_dt,
+        include_gray=include_gray,
+        thresholds=thresholds, current_threshold=current_threshold
     )
     if not minute_color:
         return False
 
-    # タイトル
     if is_full_day:
-        title = f"{date_str} 状態推移グラフ"
+        title = f"{machine_name} {date_str} 状態推移グラフ"
     else:
-        # 表示は当日内の時刻だけで十分
         s = start_dt.strftime("%H:%M")
         e = end_dt.strftime("%H:%M")
-        title = f"{date_str} 品目時間帯グラフ（{s}〜{e}）"
+        title = f"{machine_name} {date_str} 品目時間帯グラフ（{s}〜{e}）"
 
     _render_day_timeline(date_str, minute_color, out_png_path, title)
     return True
 
-def generate_graph_image(date):
-    # 互換ラッパー：そのまま呼ばれても動くように
-    return generate_graph_image_unified(date_str=date)
 
-def generate_graph_image_for_interval(date_str, start_dt, end_dt, out_png_path):
-    # 互換ラッパー：include_gray のデフォルトはこれまでと同じ挙動（灰色も描画）
+def generate_graph_image(date, machine_name):
+    """互換ラッパー"""
+    return generate_graph_image_unified(date_str=date, machine_name=machine_name)
+
+
+def generate_graph_image_for_interval(date_str, start_dt, end_dt, out_png_path, machine_name):
+    """互換ラッパー"""
     return generate_graph_image_unified(
-        date_str=date_str,
-        start_dt=start_dt,
-        end_dt=end_dt,
-        out_png_path=out_png_path,
-        include_gray=True,
-        # 区間は同じファイル名で上書きする可能性があるので常に再描画を推奨
+        date_str=date_str, machine_name=machine_name,
+        start_dt=start_dt, end_dt=end_dt,
+        out_png_path=out_png_path, include_gray=True,
         skip_if_up_to_date=False,
     )
 
-def generate_graph_image_for_intervals(date_str, intervals, out_png_path):
-    """
-    複数区間の合成グラフを1枚に描画。
-    """
+
+def generate_graph_image_for_intervals(date_str, intervals, out_png_path, machine_name):
+    """複数区間の合成グラフを1枚に描画。"""
     if not intervals:
         return False
 
-    # 分ごとの色を区間ごとに読み、ORマージ
     merged = {}
     for s_dt, e_dt in intervals:
-        mc = _load_minute_colors(date_str, start_dt=s_dt, end_dt=e_dt, include_gray=True)
+        mc = _load_minute_colors(date_str, machine_name,
+                                 start_dt=s_dt, end_dt=e_dt, include_gray=True)
         if not mc:
             continue
         merged.update(mc)
@@ -321,26 +505,22 @@ def generate_graph_image_for_intervals(date_str, intervals, out_png_path):
     if not merged:
         return False
 
-    # タイトル：最初と最後の時刻を表示
     s_label = intervals[0][0].strftime("%H:%M")
     e_label = intervals[-1][1].strftime("%H:%M")
-    title = f"{date_str} 品目時間帯グラフ（{s_label}〜{e_label}／{len(intervals)}区間）"
+    title = (f"{machine_name} {date_str} 品目時間帯グラフ"
+             f"（{s_label}〜{e_label}／{len(intervals)}区間）")
 
     _render_day_timeline(date_str, merged, out_png_path, title)
     return True
 
 
-# --- 追記: 柔軟な日時パーサ（秒あり/なしを許容） ---
+# --- 柔軟な日時パーサ（秒あり/なしを許容） ---
 def parse_flexible_dt(s):
-    """
-    "YYYY/M/D H:M[:S]" 形式（ゼロ詰め無しOK、秒あり/なし両対応）を受け付けて datetime を返す。
-    例: "2025/8/4 8:46", "2025/08/04 08:46:13"
-    """
     s = s.strip()
     fmts = [
         "%Y/%m/%d %H:%M:%S",
         "%Y/%m/%d %H:%M",
-        "%Y/%-m/%-d %-H:%-M:%-S",  # Linux系のゼロ無し。Windowsでは無視されるが例として残す
+        "%Y/%-m/%-d %-H:%-M:%-S",
         "%Y/%-m/%-d %-H:%-M",
     ]
     for fmt in fmts:
@@ -348,19 +528,18 @@ def parse_flexible_dt(s):
             return datetime.strptime(s, fmt)
         except Exception:
             continue
-    # 上の %- 指定は環境依存。最後に標準的な置換で再トライ
     try:
-        # ゼロ詰めして秒なしをまず試す
         parts = s.replace("/", " ").replace(":", " ").split()
-        # ["YYYY","M","D","H","M"(,"S")]
         if len(parts) >= 5:
             Y, M, D, h, m = parts[:5]
             sec = parts[5] if len(parts) >= 6 else "00"
-            canon = f"{int(Y):04d}/{int(M):02d}/{int(D):02d} {int(h):02d}:{int(m):02d}:{int(sec):02d}"
+            canon = (f"{int(Y):04d}/{int(M):02d}/{int(D):02d} "
+                     f"{int(h):02d}:{int(m):02d}:{int(sec):02d}")
             return datetime.strptime(canon, "%Y/%m/%d %H:%M:%S")
     except Exception:
         pass
     raise ValueError("日時の形式が不正です")
+
 
 def extract_intervals_from_row(date_str, row):
     """
@@ -373,7 +552,6 @@ def extract_intervals_from_row(date_str, row):
     now = datetime.now()
 
     intervals = []
-    # 5ペアを走査
     for i in range(5):
         s_idx = 9 + 2*i
         e_idx = 10 + 2*i
@@ -384,14 +562,13 @@ def extract_intervals_from_row(date_str, row):
         e_raw = (e_raw or "").strip()
 
         if not s_raw:
-            continue  # 開始が空→このペアなし
+            continue
 
         try:
             s_dt = parse_flexible_dt(s_raw)
         except Exception:
             continue
 
-        # 停止の補完
         e_dt = None
         if e_raw:
             try:
@@ -401,36 +578,27 @@ def extract_intervals_from_row(date_str, row):
         if e_dt is None:
             e_dt = min(now, day_end) if base_date == now.date() else day_end
 
-        # 当日範囲にクリップ
         s_dt = max(s_dt, day_start)
         e_dt = min(e_dt, day_end)
 
         if e_dt <= s_dt:
             e_dt = min(s_dt + timedelta(minutes=1), day_end)
 
-        # 最終的に当日と重なるものだけ採用
         if s_dt < e_dt:
             intervals.append((s_dt, e_dt))
 
-    # 時刻順に整列
     intervals.sort(key=lambda t: t[0])
     return intervals
 
 
 def resolve_item_interval(date_str, start_raw, end_raw):
-    """
-    品目CSVの着手・完了文字列から区間 [start_dt, end_dt) を決める。
-    - start_raw が不正なら例外を投げる（ここは必須）
-    - end_raw が空 or 不正なら“当日末(23:59:59)”まで。対象日が今日なら“現在時刻”まで。
-    """
+    """品目CSVの着手・完了文字列から区間 [start_dt, end_dt) を決める。"""
     base_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     day_start = datetime.combine(base_date, time(0, 0, 0))
     day_end   = datetime.combine(base_date, time(23, 59, 59))
 
-    # start は必須（不正なら例外）
     start_dt = parse_flexible_dt((start_raw or "").strip())
 
-    # end は任意（未記入 or 不正なら補完）
     end_dt = None
     end_raw = (end_raw or "").strip()
     if end_raw:
@@ -440,82 +608,72 @@ def resolve_item_interval(date_str, start_raw, end_raw):
             end_dt = None
 
     if end_dt is None:
-        # 未記入 or 不正 → 今日なら now まで、過去日なら当日末まで
         now = datetime.now()
         if base_date == now.date():
             end_dt = min(now, day_end)
         else:
             end_dt = day_end
 
-    # 最低限、start < end になるように当日末でクリップ
     if end_dt <= start_dt:
-        # まれに同時刻などの異常値は、1分だけ足して日内上限でクリップ
         end_dt = min(start_dt + timedelta(minutes=1), day_end)
 
     return start_dt, end_dt
 
-def get_current_processing_items(now=None):
+
+def get_current_processing_items(now=None, machine_config=None):
     if now is None:
         now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
+    hinmoku_prefix = machine_config.get('hinmoku_prefix') if machine_config else None
 
-    headers, records, expected_name = read_hinmoku_csv(today_str)
+    headers, records, expected_name = read_hinmoku_csv(today_str,
+                                                       hinmoku_prefix=hinmoku_prefix)
     result = {"has_csv": False, "expected": expected_name, "items": []}
     if not headers or records is None:
         return result
     result["has_csv"] = True
 
     for idx, row in enumerate(records, start=1):
-        if len(row) < 19:  # 最低でも停止5までの列がある想定
-            # 多少短いCSVでも、開始1(9)があれば動くように下限は緩くしてもOK
-            pass
         intervals = extract_intervals_from_row(today_str, row)
         if not intervals:
             continue
 
-        # now がどれかの区間に含まれる？
         in_any = any(s <= now < e for s, e in intervals)
         if not in_any:
             continue
 
-        # 表示用：区間を "HH:MM-HH:MM / ..." につなぐ
-        intervals_str = " / ".join(f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in intervals)
+        intervals_str = " / ".join(
+            f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in intervals)
 
         info = {
-            "kikai_no": row[0],
-            "seiban": row[1],
-            "tehai_no": row[2],
-            "hinmoku_no": row[3],
+            "kikai_no":     row[0],
+            "seiban":       row[1],
+            "tehai_no":     row[2],
+            "hinmoku_no":   row[3],
             "hinmoku_name": row[4],
-            "intervals": intervals_str,
-            "status": (row[8] if len(row) > 8 else "")
+            "intervals":    intervals_str,
+            "status":       (row[8] if len(row) > 8 else "")
         }
         result["items"].append({"index": idx, "info": info})
 
     return result
 
 
+# --- 区間限定の状態別集計ユーティリティ ---
 
-# --- 追記: 区間限定の状態別集計ユーティリティ ---
-def summarize_states_for_interval(date_str, start_dt, end_dt):
-    """
-    data/<date_str>.csv の 1分単位データを読み、[start_dt, end_dt) の区間だけ
-    状態別合計秒数を算出して返す（dict: state -> 秒）。
-    区間が当日の 0:00〜24:00 をはみ出していれば当日内にクリップする。
-    """
-    csv_path = os.path.join(DATA_DIR, f"{date_str}.csv")
+def summarize_states_for_interval(date_str, start_dt, end_dt, machine_name,
+                                   thresholds=None, current_threshold=None):
+    csv_path = os.path.join(DATA_DIR, machine_name, f"{date_str}.csv")
     if not os.path.exists(csv_path):
-        return None  # データなし
+        return None
 
     base_date = datetime.strptime(date_str, "%Y-%m-%d")
     day_start = datetime.combine(base_date, datetime.strptime("00:00:00", "%H:%M:%S").time())
     day_end   = day_start + timedelta(days=1)
 
-    # クリップ
     s = max(start_dt, day_start)
     e = min(end_dt,   day_end)
     if not (s < e):
-        # 重なりなし
         return {k: 0 for k in ["自動加工中", "手動加工中", "加工完了", "アラーム", "停止"]}
 
     states = ["自動加工中", "手動加工中", "加工完了", "アラーム", "停止"]
@@ -528,68 +686,40 @@ def summarize_states_for_interval(date_str, start_dt, end_dt):
             try:
                 t = datetime.strptime(date_str + " " + row[0], "%Y-%m-%d %H:%M:%S")
             except Exception:
-                # 時刻列が壊れている行はスキップ
                 continue
-
             if not (s <= t < e):
                 continue
-
             try:
                 r, y, g, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-                _, _, state, _ = get_light_status(r, y, g, c)
-                secs[state] += 60  # 1分分加算
+                _, _, state, _ = get_light_status(r, y, g, c,
+                                                  thresholds=thresholds,
+                                                  current_threshold=current_threshold)
+                secs[state] += 60
             except Exception:
                 continue
 
     return secs
 
-def summarize_states_for_intervals(date_str, intervals):
-    """
-    複数区間の合計（状態別・秒）を返す。
-    """
+
+def summarize_states_for_intervals(date_str, intervals, machine_name,
+                                    thresholds=None, current_threshold=None):
     if not intervals:
         return {k: 0 for k in ["自動加工中", "手動加工中", "加工完了", "アラーム", "停止"]}
     total = {k: 0 for k in ["自動加工中", "手動加工中", "加工完了", "アラーム", "停止"]}
     for s_dt, e_dt in intervals:
-        secs = summarize_states_for_interval(date_str, s_dt, e_dt)
+        secs = summarize_states_for_interval(date_str, s_dt, e_dt, machine_name,
+                                              thresholds=thresholds,
+                                              current_threshold=current_threshold)
         if secs is None:
             continue
         for k, v in secs.items():
             total[k] += v
     return total
 
-def generate_graph_image_for_intervals(date_str, intervals, out_png_path):
-    """
-    複数区間の合成グラフを1枚に描画。
-    """
-    if not intervals:
-        return False
 
-    # 分ごとの色を区間ごとに読み、ORマージ
-    merged = {}
-    for s_dt, e_dt in intervals:
-        mc = _load_minute_colors(date_str, start_dt=s_dt, end_dt=e_dt, include_gray=True)
-        if not mc:
-            continue
-        merged.update(mc)
-
-    if not merged:
-        return False
-
-    # タイトル：最初と最後の時刻を表示
-    s_label = intervals[0][0].strftime("%H:%M")
-    e_label = intervals[-1][1].strftime("%H:%M")
-    title = f"{date_str} 品目時間帯グラフ（{s_label}〜{e_label}／{len(intervals)}区間）"
-
-    _render_day_timeline(date_str, merged, out_png_path, title)
-    return True
-
-def summarize_states_full_day_hours(date_str):
-    """
-    data/<date_str>.csv を読み、日全体（24h）の状態別合計時間（h）を小数2桁で返す。
-    データが無ければ None。
-    """
-    csv_path = os.path.join(DATA_DIR, f"{date_str}.csv")
+def summarize_states_full_day_hours(date_str, machine_name,
+                                     thresholds=None, current_threshold=None):
+    csv_path = os.path.join(DATA_DIR, machine_name, f"{date_str}.csv")
     if not os.path.exists(csv_path):
         return None
     states = ["自動加工中", "手動加工中", "加工完了", "アラーム", "停止"]
@@ -600,95 +730,108 @@ def summarize_states_full_day_hours(date_str):
                 continue
             try:
                 r, y, g, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-                _, _, state, _ = get_light_status(r, y, g, c)
+                _, _, state, _ = get_light_status(r, y, g, c,
+                                                  thresholds=thresholds,
+                                                  current_threshold=current_threshold)
                 secs[state] += 60
             except Exception:
                 continue
-    return {k: round(v/3600.0, 2) for k, v in secs.items()}
+    return {k: round(v / 3600.0, 2) for k, v in secs.items()}
+
+
+# ===== Flask Routes =====
 
 @app.route("/")
 def index():
-    # --- ライト/電流の最新値（過去5分） ---
-    latest = get_latest_data()
-
-    status_debug = None
-    status_summary = None
-
-    if latest:
-        lights, machine_action, state, color = get_light_status(
-            latest["red"], latest["yellow"], latest["green"], latest["current"]
-        )
-
-        # 旧表示（デバッグ用：点灯/消灯の3円）
-        status_debug = {
-            **lights,
-            "current": latest["current"],
-            "timestamp": latest["timestamp"]
-        }
-
-        # 新表示（上部：状態1円）
-        status_summary = {
-            "state": state,               # 自動加工中/手動加工中/加工完了/アラーム/停止
-            "color": color,               # green/yellow/red/blue/gray
-            "current": latest["current"], # 必要なら下に表示できるよう残す
-            "timestamp": latest["timestamp"]
-        }
-
-    # --- 右カラム：現在の加工状況（今日のhinmoku）---
     now = datetime.now()
-    current_work = get_current_processing_items(now=now)
     today_str = now.strftime("%Y-%m-%d")
 
-    # --- 年度カレンダー（4月～翌年3月） ---
+    # --- 各機械の現在状態 ---
+    machine_statuses = []
+    for m in config['machines']:
+        machine_name      = m['name']
+        thresholds        = m.get('patlite_thresholds', THRESHOLDS)
+        curr_thresh       = m.get('current_threshold', CURRENT_THRESHOLD)
+        latest = get_latest_data(machine_name)
+
+        status_summary = None
+        status_debug   = None
+        if latest:
+            lights, machine_action, state, color = get_light_status(
+                latest["red"], latest["yellow"], latest["green"], latest["current"],
+                thresholds=thresholds, current_threshold=curr_thresh
+            )
+            status_summary = {
+                "state":     state,
+                "color":     color,
+                "current":   latest["current"],
+                "timestamp": latest["timestamp"]
+            }
+            status_debug = {
+                **lights,
+                "current":   latest["current"],
+                "timestamp": latest["timestamp"]
+            }
+        machine_statuses.append({
+            "name":              machine_name,
+            "status_summary":    status_summary,
+            "status_debug":      status_debug,
+            "thresholds":        thresholds,
+            "current_threshold": curr_thresh,
+        })
+
+    # --- 現在の加工状況（最初の機械） ---
+    first_machine_config = config['machines'][0] if config['machines'] else None
+    first_machine_name   = first_machine_config['name'] if first_machine_config else None
+    current_work = get_current_processing_items(now=now, machine_config=first_machine_config)
+
+    # --- 年度カレンダー（最初の機械） ---
     if now.month >= 4:
         fiscal_start = datetime(now.year, 4, 1)
     else:
         fiscal_start = datetime(now.year - 1, 4, 1)
     fiscal_end = fiscal_start.replace(year=fiscal_start.year + 1) - timedelta(days=1)
 
-    # 存在するCSV日付・月の判定
-    existing_days = set()
+    existing_days   = set()
     existing_months = set()
-    for fname in os.listdir(DATA_DIR):
-        if fname.endswith(".csv"):
-            try:
-                date_obj = datetime.strptime(fname[:-4], "%Y-%m-%d")
-                if fiscal_start <= date_obj <= fiscal_end:
-                    existing_days.add(date_obj.date())
-                    existing_months.add(date_obj.strftime("%Y-%m"))
-            except:
-                continue
+    if first_machine_name:
+        cal_dir = os.path.join(DATA_DIR, first_machine_name)
+        if os.path.isdir(cal_dir):
+            for fname in os.listdir(cal_dir):
+                if fname.endswith(".csv"):
+                    try:
+                        date_obj = datetime.strptime(fname[:-4], "%Y-%m-%d")
+                        if fiscal_start <= date_obj <= fiscal_end:
+                            existing_days.add(date_obj.date())
+                            existing_months.add(date_obj.strftime("%Y-%m"))
+                    except Exception:
+                        continue
 
-    # カレンダーデータ構築
     calendar = {}
-    current = fiscal_start
-    while current <= fiscal_end:
-        ym = current.strftime("%Y-%m")
+    current_day = fiscal_start
+    while current_day <= fiscal_end:
+        ym = current_day.strftime("%Y-%m")
         if ym not in calendar:
             calendar[ym] = {
                 "month_link": ym in existing_months,
                 "weeks": [[]]
             }
-
         week = calendar[ym]["weeks"][-1]
-        if len(week) == 0 and current.weekday() != 0:
-            week.extend([None] * current.weekday())
-
+        if len(week) == 0 and current_day.weekday() != 0:
+            week.extend([None] * current_day.weekday())
         week.append({
-            "day": current.day,
-            "date": current.strftime("%Y-%m-%d"),
-            "link": current.date() in existing_days
+            "day":  current_day.day,
+            "date": current_day.strftime("%Y-%m-%d"),
+            "link": current_day.date() in existing_days
         })
-
-        if current.weekday() == 6:
+        if current_day.weekday() == 6:
             calendar[ym]["weeks"].append([])
-
-        current += timedelta(days=1)
+        current_day += timedelta(days=1)
 
     return render_template(
         "index.html",
-        status_summary=status_summary,   # ★追加（上部1円）
-        status=status_debug,             # ★従来（下部へ移動するデバッグ用）
+        machine_statuses=machine_statuses,
+        first_machine_name=first_machine_name,
         thresholds=THRESHOLDS,
         current_threshold=CURRENT_THRESHOLD,
         calendar=calendar,
@@ -697,81 +840,88 @@ def index():
     )
 
 
-@app.route("/month/<year_month>/overview")
-def show_month_overview(year_month):
-    """月俯瞰：2列（左=日別サマリ、右=日別グラフ）、DD_MAX行"""
+# ===== /machine/<name>/month/<ym>/ =====
+
+@app.route("/machine/<machine_name>/month/<year_month>/overview")
+def show_month_overview(machine_name, year_month):
+    machine = _get_machine_or_404(machine_name)
+    thresholds    = machine.get('patlite_thresholds', THRESHOLDS)
+    curr_thresh   = machine.get('current_threshold', CURRENT_THRESHOLD)
     try:
         target_month = datetime.strptime(year_month, "%Y-%m")
     except ValueError:
         abort(404)
 
-    year = target_month.year
-    month = target_month.month
+    year   = target_month.year
+    month  = target_month.month
     dd_max = monthrange(year, month)[1]
 
     items = []
     for day in range(1, dd_max + 1):
         date_str = f"{year_month}-{day:02d}"
-        csv_path = os.path.join(DATA_DIR, f"{date_str}.csv")
+        csv_path = os.path.join(DATA_DIR, machine_name, f"{date_str}.csv")
 
-        durations = None
+        durations      = None
         image_filename = None
 
         if os.path.exists(csv_path):
-            # 左列：日別サマリ（時間）
-            durations = summarize_states_full_day_hours(date_str)  # dict or None（通常はdict）
-            # 右列：日別グラフ
-            generate_graph_image(date_str)  # 既存ならスキップ
-            image_filename = f"{date_str}_graph.png"
+            durations = summarize_states_full_day_hours(date_str, machine_name,
+                                                        thresholds=thresholds,
+                                                        current_threshold=curr_thresh)
+            generate_graph_image(date_str, machine_name)
+            image_filename = f"{machine_name}_{date_str}_graph.png"
 
         items.append({
-            "date": date_str,
-            "durations": durations,          # None のときは「データなし」を表示
-            "image_filename": image_filename # None のときは「グラフなし」を表示
+            "date":           date_str,
+            "durations":      durations,
+            "image_filename": image_filename
         })
 
-    return render_template("month/overview.html", year_month=year_month, items=items)
+    return render_template("month/overview.html",
+                           machine_name=machine_name,
+                           year_month=year_month, items=items)
 
-@app.route("/month/<year_month>/graph")
-def show_month_graph(year_month):
+
+@app.route("/machine/<machine_name>/month/<year_month>/graph")
+def show_month_graph(machine_name, year_month):
+    machine = _get_machine_or_404(machine_name)
     try:
         month_date = datetime.strptime(year_month, "%Y-%m")
-    except:
+    except Exception:
         abort(404)
 
-    year = month_date.year
+    year  = month_date.year
     month = month_date.month
-    day = 1
+    day   = 1
     images = []
 
     while True:
         try:
             current_date = datetime(year, month, day)
-        except:
+        except Exception:
             break
         date_str = current_date.strftime("%Y-%m-%d")
-        csv_path = os.path.join(DATA_DIR, f"{date_str}.csv")
-        image_filename = f"{date_str}_graph.png"
-        image_path = os.path.join("static", image_filename)
+        csv_path = os.path.join(DATA_DIR, machine_name, f"{date_str}.csv")
+        image_filename = f"{machine_name}_{date_str}_graph.png"
 
-        # 存在するCSVファイルについてのみ描画
         if os.path.exists(csv_path):
-            generate_graph_image(date_str)
-            images.append({
-                "date": date_str,
-                "image_filename": image_filename
-            })
-
+            generate_graph_image(date_str, machine_name)
+            images.append({"date": date_str, "image_filename": image_filename})
         day += 1
 
     if not images:
         abort(404)
 
-    return render_template("month/graph.html", year_month=year_month, images=images)
+    return render_template("month/graph.html",
+                           machine_name=machine_name,
+                           year_month=year_month, images=images)
 
 
-@app.route("/month/<year_month>/summary")
-def show_month_summary(year_month):
+@app.route("/machine/<machine_name>/month/<year_month>/summary")
+def show_month_summary(machine_name, year_month):
+    machine = _get_machine_or_404(machine_name)
+    thresholds  = machine.get('patlite_thresholds', THRESHOLDS)
+    curr_thresh = machine.get('current_threshold', CURRENT_THRESHOLD)
     try:
         target_month = datetime.strptime(year_month, "%Y-%m")
     except ValueError:
@@ -779,18 +929,16 @@ def show_month_summary(year_month):
 
     states = ["自動加工中", "手動加工中", "加工完了", "アラーム", "停止"]
 
-    # -----------------------------
-    # 9H(8:00-17:00) ベース集計
-    # -----------------------------
-    summaries_9h = {state: [] for state in states}
-    labels_9h = []  # 24h表と同じく、データがある日だけ並べる
-
-    # 24h（既存）集計
+    summaries_9h  = {state: [] for state in states}
+    labels_9h     = []
     summaries_24h = {state: [] for state in states}
-    labels_24h = []
+    labels_24h    = []
 
-    # 該当月の .csv だけを処理（ファイル名=YYYY-MM-DD.csv）
-    for fname in sorted(os.listdir(DATA_DIR)):
+    machine_dir = os.path.join(DATA_DIR, machine_name)
+    if not os.path.isdir(machine_dir):
+        abort(404, description="指定された機械のデータが見つかりませんでした")
+
+    for fname in sorted(os.listdir(machine_dir)):
         if not fname.endswith(".csv"):
             continue
         try:
@@ -801,18 +949,20 @@ def show_month_summary(year_month):
             continue
 
         date_str = date_obj.strftime("%Y-%m-%d")
-        filepath = os.path.join(DATA_DIR, fname)
+        filepath = os.path.join(machine_dir, fname)
 
-        # --- 9H（8:00-17:00） ---
+        # 9H（8:00-17:00）
         start_dt = datetime.combine(date_obj.date(), time(8, 0, 0))
-        end_dt = datetime.combine(date_obj.date(), time(17, 0, 0))
-        secs_9h = summarize_states_for_interval(date_str, start_dt, end_dt)
+        end_dt   = datetime.combine(date_obj.date(), time(17, 0, 0))
+        secs_9h  = summarize_states_for_interval(date_str, start_dt, end_dt, machine_name,
+                                                  thresholds=thresholds,
+                                                  current_threshold=curr_thresh)
         if secs_9h is not None:
             labels_9h.append(date_str)
             for state in states:
                 summaries_9h[state].append(round(secs_9h.get(state, 0) / 3600.0, 2))
 
-        # --- 24H（既存：日全体）---
+        # 24H
         labels_24h.append(date_str)
         durations_sec = {state: 0 for state in states}
         with open(filepath, newline='', encoding='utf-8') as f:
@@ -821,9 +971,11 @@ def show_month_summary(year_month):
                     continue
                 try:
                     r, y, g, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-                    _, _, state, _ = get_light_status(r, y, g, c)
+                    _, _, state, _ = get_light_status(r, y, g, c,
+                                                      thresholds=thresholds,
+                                                      current_threshold=curr_thresh)
                     durations_sec[state] += 60
-                except:
+                except Exception:
                     continue
         for state in states:
             summaries_24h[state].append(round(durations_sec[state] / 3600.0, 2))
@@ -831,79 +983,42 @@ def show_month_summary(year_month):
     if not labels_24h and not labels_9h:
         abort(404, description="指定された月にデータが見つかりませんでした")
 
-    # -----------------------------
-    # 9H表の合計（行合計/列合計/総合計）
-    # -----------------------------
-    row_totals_9h = {state: round(sum(summaries_9h[state]), 2) for state in states}
-
-    num_days_9h = len(labels_9h)
+    # 9H集計
+    row_totals_9h    = {state: round(sum(summaries_9h[state]), 2) for state in states}
+    num_days_9h      = len(labels_9h)
+    working_states   = ["自動加工中", "手動加工中", "加工完了"]
     column_totals_9h = []
-    
-    working_states = ["自動加工中", "手動加工中", "加工完了"]
-    
     for i in range(num_days_9h):
-        day_sum = 0.0
-        for state in states:
-            if i < len(summaries_9h[state]):
-                day_sum += summaries_9h[state][i]
+        day_sum = sum(summaries_9h[s][i] for s in states if i < len(summaries_9h[s]))
         column_totals_9h.append(round(day_sum, 2))
     grand_total_9h = round(sum(row_totals_9h.values()), 2)
-    
-    # --- 9H 稼働時間合計(時間)（自動+手動+完了）---
-    working_states = ["自動加工中", "手動加工中", "加工完了"]
-
-    num_days_9h = len(labels_9h)
 
     working_column_totals_9h = []
     for i in range(num_days_9h):
-        work_sum = 0.0
-        for s in working_states:
-            if i < len(summaries_9h[s]):
-                work_sum += summaries_9h[s][i]
+        work_sum = sum(summaries_9h[s][i] for s in working_states if i < len(summaries_9h[s]))
         working_column_totals_9h.append(round(work_sum, 2))
-
     working_grand_total_9h = round(sum(working_column_totals_9h), 2)
 
-
-    # -----------------------------
-    # 24H表の合計（既存）
-    # -----------------------------
-    row_totals_24h = {state: round(sum(summaries_24h[state]), 2) for state in states}
-
-    num_days_24h = len(labels_24h)
+    # 24H集計
+    row_totals_24h    = {state: round(sum(summaries_24h[state]), 2) for state in states}
+    num_days_24h      = len(labels_24h)
     column_totals_24h = []
-    
-    # --- 24H 稼働時間合計(時間)（自動+手動+完了）---
-    working_states = ["自動加工中", "手動加工中", "加工完了"]
-
-    working_column_totals_24h = []
     for i in range(num_days_24h):
-        work_sum = 0.0
-        for s in working_states:
-            if i < len(summaries_24h[s]):
-                work_sum += summaries_24h[s][i]
-        working_column_totals_24h.append(round(work_sum, 2))
-
-    working_grand_total_24h = round(sum(working_column_totals_24h), 2)
-
-    
-    for i in range(num_days_24h):
-        day_sum = 0.0
-        for state in states:
-            if i < len(summaries_24h[state]):
-                day_sum += summaries_24h[state][i]
+        day_sum = sum(summaries_24h[s][i] for s in states if i < len(summaries_24h[s]))
         column_totals_24h.append(round(day_sum, 2))
     grand_total_24h = round(sum(row_totals_24h.values()), 2)
 
-    # -----------------------------
-    # 9H 月次棒グラフ（%）＋ 合計（%）折れ線を生成
-    # -----------------------------
-    # 横軸は 1..月末日
-    year = target_month.year
-    month = target_month.month
+    working_column_totals_24h = []
+    for i in range(num_days_24h):
+        work_sum = sum(summaries_24h[s][i] for s in working_states if i < len(summaries_24h[s]))
+        working_column_totals_24h.append(round(work_sum, 2))
+    working_grand_total_24h = round(sum(working_column_totals_24h), 2)
+
+    # 9H月次棒グラフ
+    year   = target_month.year
+    month  = target_month.month
     dd_max = monthrange(year, month)[1]
 
-    # 日->状態別(時間) を作る（データが無い日は0）
     map_9h_hours = {}
     for idx, d in enumerate(labels_9h):
         per_day = {s: 0.0 for s in states}
@@ -912,44 +1027,33 @@ def show_month_summary(year_month):
                 per_day[s] = summaries_9h[s][idx]
         map_9h_hours[d] = per_day
 
-    working_states = ["自動加工中", "手動加工中", "加工完了"]
-
-    # plot 用の配列
-    days = list(range(1, dd_max + 1))
-    bar_values_pct = {s: [] for s in states}
+    days              = list(range(1, dd_max + 1))
+    bar_values_pct    = {s: [] for s in states}
     working_total_pct = []
 
     for day in days:
         date_str = f"{year_month}-{day:02d}"
-        per_day = map_9h_hours.get(date_str, {s: 0.0 for s in states})
-
-        # 各状態：9hを100%とする
+        per_day  = map_9h_hours.get(date_str, {s: 0.0 for s in states})
         for s in states:
             bar_values_pct[s].append((per_day[s] / 9.0) * 100.0)
-
-        # 稼働時間合計（%）＝ 自動+手動+完了
-        working_h = 0.0
-        for s in working_states:
-            working_h += per_day[s]
+        working_h = sum(per_day[s] for s in working_states)
         working_total_pct.append((working_h / 9.0) * 100.0)
 
-    # 画像保存
     os.makedirs("static", exist_ok=True)
-    summary9_png = f"{year_month}_summary_9h.png"
+    summary9_png  = f"{machine_name}_{year_month}_summary_9h.png"
     summary9_path = os.path.join("static", summary9_png)
 
     set_japanese_font()
     plt.figure(figsize=(16, 5))
 
-    # 5本棒（グループ化）
-    x = days
-    width = 0.15
+    x      = days
+    width  = 0.15
     offsets = {
         "自動加工中": -2*width,
         "手動加工中": -1*width,
-        "加工完了":   0*width,
-        "アラーム":   1*width,
-        "停止":       2*width,
+        "加工完了":    0*width,
+        "アラーム":    1*width,
+        "停止":        2*width,
     }
     colors = {
         "自動加工中": "green",
@@ -958,19 +1062,16 @@ def show_month_summary(year_month):
         "アラーム":   "red",
         "停止":       "gray",
     }
-
     for s in states:
         xs = [v + offsets[s] for v in x]
         plt.bar(xs, bar_values_pct[s], width=width, label=s, color=colors[s])
 
-    # 合計（%）を折れ線（点付き）
     plt.plot(x, working_total_pct, marker="o", linestyle="-", label="稼働時間合計(%)")
-
     plt.xticks(days, [str(d) for d in days])
     plt.ylim(0, 100)
     plt.xlabel("日")
     plt.ylabel("稼働率(%)（9H=100%）")
-    plt.title(f"{year_month} 定時(8:00-17:00) 稼働率（9Hベース）")
+    plt.title(f"{machine_name} {year_month} 定時(8:00-17:00) 稼働率（9Hベース）")
     plt.grid(True, axis="y", linestyle="--", linewidth=0.5)
     plt.legend()
     plt.tight_layout()
@@ -982,10 +1083,9 @@ def show_month_summary(year_month):
 
     return render_template(
         "month/summary.html",
+        machine_name=machine_name,
         year_month=year_month,
         states=states,
-
-        # --- 9H ---
         labels_9h=labels_9h,
         summaries_9h=summaries_9h,
         row_totals_9h=row_totals_9h,
@@ -994,8 +1094,6 @@ def show_month_summary(year_month):
         working_column_totals_9h=working_column_totals_9h,
         working_grand_total_9h=working_grand_total_9h,
         summary9_png=summary9_png,
-
-        # --- 24H（既存）---
         labels=labels_24h,
         summaries=summaries_24h,
         row_totals=row_totals_24h,
@@ -1006,70 +1104,79 @@ def show_month_summary(year_month):
     )
 
 
-@app.route("/date/<date>/overview")
-def show_date_overview(date):
+# ===== /machine/<name>/date/<date>/ =====
+
+@app.route("/machine/<machine_name>/date/<date>/overview")
+def show_date_overview(machine_name, date):
+    machine = _get_machine_or_404(machine_name)
+    thresholds  = machine.get('patlite_thresholds', THRESHOLDS)
+    curr_thresh = machine.get('current_threshold', CURRENT_THRESHOLD)
+    hinmoku_prefix = machine.get('hinmoku_prefix')
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         abort(404)
 
     items = []
-    # 行1（日全体）
-    day_img = f"{date}_graph.png"
-    generate_graph_image_unified(date_str=date, out_png_path=os.path.join("static", day_img))
-    day_durations = summarize_states_full_day_hours(date)
+    day_img = f"{machine_name}_{date}_graph.png"
+    generate_graph_image_unified(date_str=date, machine_name=machine_name,
+                                 out_png_path=os.path.join("static", day_img),
+                                 thresholds=thresholds, current_threshold=curr_thresh)
+    day_durations = summarize_states_full_day_hours(date, machine_name,
+                                                    thresholds=thresholds,
+                                                    current_threshold=curr_thresh)
     if day_durations is None:
         abort(404, description=f"{date}.csv が見つかりません。")
     items.append({
-        "kind": "day",
-        "index": None,
-        "info": None,
-        "durations": day_durations,
-        "image_filename": day_img
+        "kind": "day", "index": None, "info": None,
+        "durations": day_durations, "image_filename": day_img
     })
 
-    # 品目列（新CSV：状態＋開始/停止×5）
-    headers, records, _ = read_hinmoku_csv(date)
+    headers, records, _ = read_hinmoku_csv(date, hinmoku_prefix=hinmoku_prefix)
     if headers and records:
         for idx, row in enumerate(records, start=1):
             intervals = extract_intervals_from_row(date, row)
             if not intervals:
                 continue
 
-            # 状態別集計（時間）
-            secs = summarize_states_for_intervals(date, intervals)
+            secs = summarize_states_for_intervals(date, intervals, machine_name,
+                                                  thresholds=thresholds,
+                                                  current_threshold=curr_thresh)
             durations_hours = {k: round(v / 3600.0, 2) for k, v in secs.items()}
 
-            # 画像（複数区間）
-            img_name = f"{date}_hinmoku_{idx}.png"
-            ok = generate_graph_image_for_intervals(date, intervals, os.path.join("static", img_name))
+            img_name = f"{machine_name}_{date}_hinmoku_{idx}.png"
+            ok = generate_graph_image_for_intervals(date, intervals,
+                                                    os.path.join("static", img_name),
+                                                    machine_name)
             image_filename = img_name if ok else None
 
-            intervals_str = " / ".join(f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in intervals)
+            intervals_str = " / ".join(
+                f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in intervals)
 
             items.append({
-                "kind": "item",
-                "index": idx,
+                "kind": "item", "index": idx,
                 "info": {
-                    "kikai_no": row[0],
-                    "seiban": row[1],
-                    "tehai_no": row[2],
-                    "hinmoku_no": row[3],
+                    "kikai_no":     row[0],
+                    "seiban":       row[1],
+                    "tehai_no":     row[2],
+                    "hinmoku_no":   row[3],
                     "hinmoku_name": row[4],
-                    "status": (row[8] if len(row) > 8 else ""),
-                    "intervals": intervals_str,
+                    "status":       (row[8] if len(row) > 8 else ""),
+                    "intervals":    intervals_str,
                 },
-                "durations": durations_hours,
-                "image_filename": image_filename
+                "durations": durations_hours, "image_filename": image_filename
             })
 
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
-    return render_template("date/overview.html", date=date, year_month=year_month, items=items)
-    
-@app.route("/date/<date>/table")
-def show_table(date):
-    filename = f"{date}.csv"
-    filepath = os.path.join(DATA_DIR, filename)
+    return render_template("date/overview.html",
+                           machine_name=machine_name,
+                           date=date, year_month=year_month, items=items)
+
+
+@app.route("/machine/<machine_name>/date/<date>/table")
+def show_table(machine_name, date):
+    machine = _get_machine_or_404(machine_name)
+    filepath = os.path.join(DATA_DIR, machine_name, f"{date}.csv")
     if not os.path.exists(filepath):
         abort(404)
     rows = []
@@ -1078,21 +1185,21 @@ def show_table(date):
             if len(row) < 5:
                 continue
             rows.append({
-                "time": row[0],
-                "red": row[1],
-                "yellow": row[2],
-                "green": row[3],
-                "current": row[4]
+                "time": row[0], "red": row[1], "yellow": row[2],
+                "green": row[3], "current": row[4]
             })
-    
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
-    
-    return render_template("date/sensor_data_list.html", date=date,year_month=year_month, rows=rows)
+    return render_template("date/sensor_data_list.html",
+                           machine_name=machine_name,
+                           date=date, year_month=year_month, rows=rows)
 
-@app.route("/date/<date>/status")
-def show_status_table(date):
-    filename = f"{date}.csv"
-    filepath = os.path.join(DATA_DIR, filename)
+
+@app.route("/machine/<machine_name>/date/<date>/status")
+def show_status_table(machine_name, date):
+    machine = _get_machine_or_404(machine_name)
+    thresholds  = machine.get('patlite_thresholds', THRESHOLDS)
+    curr_thresh = machine.get('current_threshold', CURRENT_THRESHOLD)
+    filepath = os.path.join(DATA_DIR, machine_name, f"{date}.csv")
     if not os.path.exists(filepath):
         abort(404)
     rows = []
@@ -1100,47 +1207,54 @@ def show_status_table(date):
         for row in csv.reader(f):
             if len(row) < 5:
                 continue
-            red, yellow, green, current = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-            lights, machine_action, state, color = get_light_status(red, yellow, green, current)
+            red, yellow, green, current = (float(row[1]), float(row[2]),
+                                            float(row[3]), float(row[4]))
+            lights, machine_action, state, color = get_light_status(
+                red, yellow, green, current,
+                thresholds=thresholds, current_threshold=curr_thresh)
             rows.append({
-                "time": row[0],
-                "red": lights["red"],
-                "yellow": lights["yellow"],
-                "green": lights["green"],
-                "machine_action": machine_action,
-                "state": state,
-                "color": color
+                "time": row[0], "red": lights["red"], "yellow": lights["yellow"],
+                "green": lights["green"], "machine_action": machine_action,
+                "state": state, "color": color
             })
-
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
-    return render_template("date/status_list.html", date=date,year_month=year_month, rows=rows)
+    return render_template("date/status_list.html",
+                           machine_name=machine_name,
+                           date=date, year_month=year_month, rows=rows)
 
-@app.route("/date/<date>/graph")
-def show_graph(date):
-    image_filename = f"{date}_graph.png"
-    image_path = os.path.join("static", image_filename)
 
-    csv_path = os.path.join(DATA_DIR, f"{date}.csv")
+@app.route("/machine/<machine_name>/date/<date>/graph")
+def show_graph(machine_name, date):
+    machine = _get_machine_or_404(machine_name)
+    thresholds  = machine.get('patlite_thresholds', THRESHOLDS)
+    curr_thresh = machine.get('current_threshold', CURRENT_THRESHOLD)
+    csv_path = os.path.join(DATA_DIR, machine_name, f"{date}.csv")
     if not os.path.exists(csv_path):
         abort(404)
 
-    # グラフ生成（既存ならスキップ）
-    generate_graph_image(date)
-
+    image_filename = f"{machine_name}_{date}_graph.png"
+    image_path     = os.path.join("static", image_filename)
+    generate_graph_image_unified(date_str=date, machine_name=machine_name,
+                                 thresholds=thresholds, current_threshold=curr_thresh)
     if not os.path.exists(image_path):
         abort(400, description="グラフ画像の生成に失敗しました。")
 
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
+    return render_template("date/graph.html",
+                           machine_name=machine_name,
+                           date=date, year_month=year_month, image_filename=image_filename)
 
-    return render_template("date/graph.html", date=date, year_month=year_month, image_filename=image_filename)
 
-@app.route("/date/<date>/summary")
-def show_day_summary(date):
-    filepath = os.path.join(DATA_DIR, f"{date}.csv")
+@app.route("/machine/<machine_name>/date/<date>/summary")
+def show_day_summary(machine_name, date):
+    machine = _get_machine_or_404(machine_name)
+    thresholds  = machine.get('patlite_thresholds', THRESHOLDS)
+    curr_thresh = machine.get('current_threshold', CURRENT_THRESHOLD)
+    filepath = os.path.join(DATA_DIR, machine_name, f"{date}.csv")
     if not os.path.exists(filepath):
         abort(404)
 
-    states = ["自動加工中", "手動加工中", "加工完了", "アラーム", "停止"]
+    states    = ["自動加工中", "手動加工中", "加工完了", "アラーム", "停止"]
     durations = {state: 0 for state in states}
 
     with open(filepath, newline='', encoding='utf-8') as f:
@@ -1149,121 +1263,119 @@ def show_day_summary(date):
                 continue
             try:
                 r, y, g, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-                _, _, state, _ = get_light_status(r, y, g, c)
-                durations[state] += 60  # assuming 1 minute resolution
-            except:
+                _, _, state, _ = get_light_status(r, y, g, c,
+                                                  thresholds=thresholds,
+                                                  current_threshold=curr_thresh)
+                durations[state] += 60
+            except Exception:
                 continue
 
     for key in durations:
         durations[key] = round(durations[key] / 3600, 2)
 
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
+    return render_template("date/summary.html",
+                           machine_name=machine_name,
+                           date=date, year_month=year_month, durations=durations)
 
-    return render_template("date/summary.html", date=date, year_month=year_month, durations=durations)
 
-@app.route("/date/<date>/hinmoku")
-def show_hinmoku_for_date(date):
-    """
-    指定日付の品目一覧（行頭に 1..N の行番号列を追加＆リンク化）
-    """
-    # 日付バリデーション
+@app.route("/machine/<machine_name>/date/<date>/hinmoku")
+def show_hinmoku_for_date(machine_name, date):
+    machine = _get_machine_or_404(machine_name)
+    hinmoku_prefix = machine.get('hinmoku_prefix')
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         abort(404)
 
-    headers, records, filename = read_hinmoku_csv(date)
+    headers, records, filename = read_hinmoku_csv(date, hinmoku_prefix=hinmoku_prefix)
     if not headers or records is None:
         return render_template(
             "date/hinmoku_list.html",
-            has_data=False,
-            date=date,
+            machine_name=machine_name,
+            has_data=False, date=date,
             message="品目リストはありません"
         )
 
-    # 先頭に「#」列を追加したヘッダ
     display_headers = ["#"] + headers
-
-    # 行番号を付与（1始まり）。リンク先は /date/<date>/hinmoku/<idx>
-    # テンプレ側でリンクを生成するため、ここではインデックスのみ渡す
-    indexed_records = []
-    for i, row in enumerate(records, start=1):
-        indexed_records.append((i, row))  # (行番号, 元の行)
+    indexed_records = [(i, row) for i, row in enumerate(records, start=1)]
 
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
-    
     return render_template(
         "date/hinmoku_list.html",
-        has_data=True,
-        date=date,
-        year_month=year_month,
-        headers=display_headers,
-        records=indexed_records,
-        filename=filename
+        machine_name=machine_name,
+        has_data=True, date=date, year_month=year_month,
+        headers=display_headers, records=indexed_records, filename=filename
     )
 
-@app.route("/date/<date>/hinmoku/<int:hinmokuno>")
-def show_hinmoku_graph(date, hinmokuno):
+
+@app.route("/machine/<machine_name>/date/<date>/hinmoku/<int:hinmokuno>")
+def show_hinmoku_graph(machine_name, date, hinmokuno):
+    machine = _get_machine_or_404(machine_name)
+    hinmoku_prefix = machine.get('hinmoku_prefix')
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         abort(404)
 
-    headers, records, filename = read_hinmoku_csv(date)
+    headers, records, filename = read_hinmoku_csv(date, hinmoku_prefix=hinmoku_prefix)
     if not headers or not records:
         abort(404, description="品目リストがありません。")
-
     if hinmokuno < 1 or hinmokuno > len(records):
         abort(404, description="指定の品目番号が範囲外です。")
 
-    row = records[hinmokuno - 1]
+    row       = records[hinmokuno - 1]
     intervals = extract_intervals_from_row(date, row)
     if not intervals:
         abort(400, description="有効な開始/停止区間がありません。")
 
-    image_filename = f"{date}_hinmoku_{hinmokuno}.png"
-    image_path = os.path.join("static", image_filename)
-    ok = generate_graph_image_for_intervals(date, intervals, image_path)
+    image_filename = f"{machine_name}_{date}_hinmoku_{hinmokuno}.png"
+    image_path     = os.path.join("static", image_filename)
+    ok = generate_graph_image_for_intervals(date, intervals, image_path, machine_name)
     if not ok:
         abort(400, description="グラフ画像の生成に失敗しました。対象区間にデータが無い可能性があります。")
 
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
     return render_template(
         "hinmoku/graph.html",
-        date=date,
-        year_month=year_month,
-        hinmokuno=hinmokuno,
-        image_filename=image_filename,
-        row=row,
-        headers=headers
+        machine_name=machine_name,
+        date=date, year_month=year_month, hinmokuno=hinmokuno,
+        image_filename=image_filename, row=row, headers=headers
     )
 
-@app.route("/date/<date>/hinmoku/<int:hinmokuno>/summary")
-def show_hinmoku_summary(date, hinmokuno):
+
+@app.route("/machine/<machine_name>/date/<date>/hinmoku/<int:hinmokuno>/summary")
+def show_hinmoku_summary(machine_name, date, hinmokuno):
+    machine = _get_machine_or_404(machine_name)
+    thresholds     = machine.get('patlite_thresholds', THRESHOLDS)
+    curr_thresh    = machine.get('current_threshold', CURRENT_THRESHOLD)
+    hinmoku_prefix = machine.get('hinmoku_prefix')
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         abort(404)
 
-    headers, records, filename = read_hinmoku_csv(date)
+    headers, records, filename = read_hinmoku_csv(date, hinmoku_prefix=hinmoku_prefix)
     if not headers or not records:
         abort(404, description="品目リストがありません。")
-
     if hinmokuno < 1 or hinmokuno > len(records):
         abort(404, description="指定の品目番号が範囲外です。")
 
-    row = records[hinmokuno - 1]
+    row       = records[hinmokuno - 1]
     intervals = extract_intervals_from_row(date, row)
     if not intervals:
         abort(404, description="有効な開始/停止区間がありません。")
 
-    secs = summarize_states_for_intervals(date, intervals)
+    secs = summarize_states_for_intervals(date, intervals, machine_name,
+                                          thresholds=thresholds,
+                                          current_threshold=curr_thresh)
     if secs is None:
         abort(404, description=f"{date}.csv が見つかりません。")
 
     durations_hours = {k: round(v / 3600.0, 2) for k, v in secs.items()}
     interval_info = {
-        "intervals": " / ".join(f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in intervals),
+        "intervals": " / ".join(
+            f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in intervals),
         "clipped_date": date,
         "status": (row[8] if len(row) > 8 else "")
     }
@@ -1271,42 +1383,45 @@ def show_hinmoku_summary(date, hinmokuno):
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
     return render_template(
         "hinmoku/summary.html",
-        date=date,
-        year_month=year_month,
-        hinmokuno=hinmokuno,
-        headers=headers,
-        row=row,
-        durations=durations_hours,
-        interval=interval_info,
-        filename=filename
+        machine_name=machine_name,
+        date=date, year_month=year_month, hinmokuno=hinmokuno,
+        headers=headers, row=row, durations=durations_hours,
+        interval=interval_info, filename=filename
     )
 
-@app.route("/date/<date>/hinmoku/<int:hinmokuno>/info")
-def show_hinmoku_info(date, hinmokuno):
+
+@app.route("/machine/<machine_name>/date/<date>/hinmoku/<int:hinmokuno>/info")
+def show_hinmoku_info(machine_name, date, hinmokuno):
+    machine = _get_machine_or_404(machine_name)
+    thresholds     = machine.get('patlite_thresholds', THRESHOLDS)
+    curr_thresh    = machine.get('current_threshold', CURRENT_THRESHOLD)
+    hinmoku_prefix = machine.get('hinmoku_prefix')
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         abort(404)
 
-    headers, records, filename = read_hinmoku_csv(date)
+    headers, records, filename = read_hinmoku_csv(date, hinmoku_prefix=hinmoku_prefix)
     if not headers or not records:
         abort(404, description="品目リストがありません。")
-
     if hinmokuno < 1 or hinmokuno > len(records):
         abort(404, description="指定の品目番号が範囲外です。")
 
-    row = records[hinmokuno - 1]
+    row       = records[hinmokuno - 1]
     intervals = extract_intervals_from_row(date, row)
     if not intervals:
         abort(404, description="有効な開始/停止区間がありません。")
 
-    secs = summarize_states_for_intervals(date, intervals)
+    secs = summarize_states_for_intervals(date, intervals, machine_name,
+                                          thresholds=thresholds,
+                                          current_threshold=curr_thresh)
     if secs is None:
         abort(404, description=f"{date}.csv が見つかりません。")
 
     durations_hours = {k: round(v / 3600.0, 2) for k, v in secs.items()}
     interval_info = {
-        "intervals": " / ".join(f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in intervals),
+        "intervals": " / ".join(
+            f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e in intervals),
         "clipped_date": date,
         "status": (row[8] if len(row) > 8 else "")
     }
@@ -1314,15 +1429,93 @@ def show_hinmoku_info(date, hinmokuno):
     year_month = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m")
     return render_template(
         "hinmoku/info.html",
-        date=date,
-        year_month=year_month,
-        hinmokuno=hinmokuno,
-        headers=headers,
-        row=row,
-        durations=durations_hours,
-        interval=interval_info,
-        filename=filename
+        machine_name=machine_name,
+        date=date, year_month=year_month, hinmokuno=hinmokuno,
+        headers=headers, row=row, durations=durations_hours,
+        interval=interval_info, filename=filename
     )
 
+
+# ===== 後方互換リダイレクト =====
+
+@app.route("/month/<year_month>/overview")
+def compat_month_overview(year_month):
+    return redirect(url_for('show_month_overview',
+                            machine_name=_first_machine_name(),
+                            year_month=year_month), 302)
+
+
+@app.route("/month/<year_month>/graph")
+def compat_month_graph(year_month):
+    return redirect(url_for('show_month_graph',
+                            machine_name=_first_machine_name(),
+                            year_month=year_month), 302)
+
+
+@app.route("/month/<year_month>/summary")
+def compat_month_summary(year_month):
+    return redirect(url_for('show_month_summary',
+                            machine_name=_first_machine_name(),
+                            year_month=year_month), 302)
+
+
+@app.route("/date/<date>/overview")
+def compat_date_overview(date):
+    return redirect(url_for('show_date_overview',
+                            machine_name=_first_machine_name(), date=date), 302)
+
+
+@app.route("/date/<date>/graph")
+def compat_date_graph(date):
+    return redirect(url_for('show_graph',
+                            machine_name=_first_machine_name(), date=date), 302)
+
+
+@app.route("/date/<date>/summary")
+def compat_date_summary(date):
+    return redirect(url_for('show_day_summary',
+                            machine_name=_first_machine_name(), date=date), 302)
+
+
+@app.route("/date/<date>/table")
+def compat_date_table(date):
+    return redirect(url_for('show_table',
+                            machine_name=_first_machine_name(), date=date), 302)
+
+
+@app.route("/date/<date>/status")
+def compat_date_status(date):
+    return redirect(url_for('show_status_table',
+                            machine_name=_first_machine_name(), date=date), 302)
+
+
+@app.route("/date/<date>/hinmoku")
+def compat_date_hinmoku(date):
+    return redirect(url_for('show_hinmoku_for_date',
+                            machine_name=_first_machine_name(), date=date), 302)
+
+
+@app.route("/date/<date>/hinmoku/<int:hinmokuno>")
+def compat_hinmoku_graph(date, hinmokuno):
+    return redirect(url_for('show_hinmoku_graph',
+                            machine_name=_first_machine_name(),
+                            date=date, hinmokuno=hinmokuno), 302)
+
+
+@app.route("/date/<date>/hinmoku/<int:hinmokuno>/summary")
+def compat_hinmoku_summary(date, hinmokuno):
+    return redirect(url_for('show_hinmoku_summary',
+                            machine_name=_first_machine_name(),
+                            date=date, hinmokuno=hinmokuno), 302)
+
+
+@app.route("/date/<date>/hinmoku/<int:hinmokuno>/info")
+def compat_hinmoku_info(date, hinmokuno):
+    return redirect(url_for('show_hinmoku_info',
+                            machine_name=_first_machine_name(),
+                            date=date, hinmokuno=hinmokuno), 302)
+
+
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    # use_reloader=False: werkzeug の2重プロセス起動を防ぎ polling_loop が1本だけ動く
+    app.run(debug=True, host="0.0.0.0", port=5000, use_reloader=False)

@@ -1,0 +1,16 @@
+serial_port: /dev/ttyUSB0
+serial_baud: 9600
+gw_channel: 2        # CH2 = 921.0 MHz (Zone A)
+gw_addr: 0x0000
+poll_interval_sec: 60
+
+machines:
+  - name: "A214"
+    patlite_addr: 0x0101
+    current_addr:  0x0102
+    hinmoku_prefix: "A214"   # 品目CSV: A214_YYYYMMDD.csv
+    patlite_thresholds:
+      red: 200
+      yellow: 200
+      green: 200
+    current_threshold: 3.0

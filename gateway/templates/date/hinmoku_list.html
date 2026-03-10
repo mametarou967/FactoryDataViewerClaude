@@ -17,7 +17,7 @@
           {# records は (行番号, 元行[]) のタプル #}
           {% for idx, row in records %}
             <tr>
-              <td><a href="/date/{{ date }}/hinmoku/{{ idx }}">{{ idx }}</a></td>
+              <td><a href="/machine/{{ machine_name }}/date/{{ date }}/hinmoku/{{ idx }}">{{ idx }}</a></td>
               {% for col in row %}
                 <td>{{ col }}</td>
               {% endfor %}

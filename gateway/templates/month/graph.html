@@ -3,11 +3,11 @@
     {% for item in images %}
         <!-- 日付見出しの余白を詰める -->
         <h3 style="margin: 4px 0; font-size: 15px; line-height: 1.2;">
-          <a href="/date/{{ item.date }}/graph">{{ item.date }}</a>
+          <a href="/machine/{{ machine_name }}/date/{{ item.date }}/graph">{{ item.date }}</a>
         </h3>
 
         <!-- 画像の幅・高さはそのまま維持 -->
-        <a href="/date/{{ item.date }}/graph">
+        <a href="/machine/{{ machine_name }}/date/{{ item.date }}/graph">
           <img
             src="/static/{{ item.image_filename }}"
             alt="{{ item.date }} のグラフ"

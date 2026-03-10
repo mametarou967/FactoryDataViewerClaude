@@ -4,9 +4,9 @@
   {{ super() }}
   <div class="line">
     <span>製番:{{ row[1] }}-手配番号:{{ row[2] }}-品目番号:{{ row[3] }}-品目名:{{ row[4] }}</span>
-    <span class="divider">|</span><a href="/date/{{ date }}/hinmoku/{{ hinmokuno }}">グラフ表示</a>
-    <span class="divider">|</span><a href="/date/{{ date }}/hinmoku/{{ hinmokuno }}/summary">稼働時間集計表示</a>
-    <span class="divider">|</span><a href="/date/{{ date }}/hinmoku/{{ hinmokuno }}/info">本日分の手配情報</a>
+    <span class="divider">|</span><a href="/machine/{{ machine_name }}/date/{{ date }}/hinmoku/{{ hinmokuno }}">グラフ表示</a>
+    <span class="divider">|</span><a href="/machine/{{ machine_name }}/date/{{ date }}/hinmoku/{{ hinmokuno }}/summary">稼働時間集計表示</a>
+    <span class="divider">|</span><a href="/machine/{{ machine_name }}/date/{{ date }}/hinmoku/{{ hinmokuno }}/info">本日分の手配情報</a>
   </div>
 {% endblock %}
 

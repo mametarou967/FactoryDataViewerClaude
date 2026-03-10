@@ -24,9 +24,9 @@
       <!-- 左列：日別サマリ -->
       <div class="card">
         <h4 class="dayhead">
-          <a href="/date/{{ it.date }}/summary">{{ it.date }}</a>
+          <a href="/machine/{{ machine_name }}/date/{{ it.date }}/summary">{{ it.date }}</a>
           <span class="divider">|</span>
-          <a href="/date/{{ it.date }}/overview">日の俯瞰</a>
+          <a href="/machine/{{ machine_name }}/date/{{ it.date }}/overview">日の俯瞰</a>
         </h4>
 
         {% if it.durations %}
@@ -54,7 +54,7 @@
       <!-- 右列：日別グラフ -->
       <div class="card imgwrap">
         {% if it.image_filename %}
-          <a href="/date/{{ it.date }}/graph" title="{{ it.date }} のグラフ">
+          <a href="/machine/{{ machine_name }}/date/{{ it.date }}/graph" title="{{ it.date }} のグラフ">
             <img
               src="/static/{{ it.image_filename }}"
               alt="{{ it.date }} のグラフ"
