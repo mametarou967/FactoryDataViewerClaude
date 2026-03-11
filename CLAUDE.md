@@ -58,7 +58,7 @@ firmware/
   sandbox/        # 既存センサーコード（参照用）
   edge_unit/      # メインスケッチ（実装中）
 gateway/
-  app.py          # Flask統合アプリ（LoRaポーリング + Web UI + メンテ画面）（再実装予定）
+  app.py          # Flask統合アプリ（LoRaポーリング + Web UI + メンテ画面）
   server_file_copy.py  # SMBファイル同期（cron独立実行）
   lora_logger.py  # プロトタイプ版（参照用・廃止予定）
 hardware/         # KiCadスケマティック

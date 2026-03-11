@@ -43,8 +43,9 @@ app.py
     ├─ /machine/<name>/date/<date>/table          生データテーブル
     ├─ /machine/<name>/date/<date>/status         現在状態
     ├─ /machine/<name>/date/<date>/hinmoku        品目一覧
-    ├─ /machine/<name>/date/<date>/hinmoku/<n>    品目グラフ
+    ├─ /machine/<name>/date/<date>/hinmoku/<n>          品目グラフ
     ├─ /machine/<name>/date/<date>/hinmoku/<n>/summary  品目稼働集計
+    ├─ /machine/<name>/date/<date>/hinmoku/<n>/info     品目手配情報
     ├─ /machine/<name>/month/<ym>/graph           月別グラフ
     ├─ /machine/<name>/month/<ym>/overview        月俯瞰
     ├─ /machine/<name>/month/<ym>/summary         月別稼働集計
