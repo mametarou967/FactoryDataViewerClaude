@@ -1,10 +1,11 @@
-from flask import Flask, render_template, abort, send_file, redirect, url_for
+from flask import Flask, render_template, abort, send_file, redirect, url_for, jsonify, request
 import csv
 import os
 from datetime import datetime, timedelta, time
 import time as _time
 import threading
 import queue
+import uuid
 
 try:
     import yaml
@@ -139,7 +140,10 @@ def write_sensor_csv(machine_name, red, yellow, green, current):
 
 # ===== ポーリングスレッド =====
 
-g_cmd_q = queue.Queue()
+g_cmd_q     = queue.Queue()
+g_results   = {}               # {req_id: {'status': 'pending'|'done', ...}}
+g_res_lock  = threading.Lock()
+g_maint_event = threading.Event()  # Flaskがコマンドを積んだらセット → polling_loopが早期起床
 
 
 def poll_machine(ser, machine):
@@ -159,7 +163,45 @@ def poll_machine(ser, machine):
 
 
 def _handle_maint(ser, req):
-    pass  # Step3で実装
+    req_id = req['req_id']
+    cmd    = req['cmd']   # 'K' / 'V' / 'H'
+    addr   = req['addr']  # int
+    ch     = config['gw_channel']
+
+    e220_send(ser, addr, ch, cmd)
+    data = e220_recv(ser)
+    _time.sleep(0.3)  # E220が受信待ち状態から抜けるのを待つ（連続送信時のタイムアウト誤検知防止）
+
+    if data is None:
+        result = {'ok': False, 'error': 'timeout'}
+    elif len(data) >= 3 and data[2] == ord('E'):
+        code = data[3] if len(data) > 3 else 0
+        result = {'ok': False, 'error': f'edge error 0x{code:02X}'}
+    elif cmd == 'K':
+        result = {'ok': True}
+    elif cmd == 'V':
+        result = ({'ok': True, 'version': f"{data[3]}.{data[4]}.{data[5]}"}
+                  if len(data) >= 6 else {'ok': False, 'error': 'short response'})
+    elif cmd == 'H':
+        if len(data) >= 9:
+            dip = data[3]
+            result = {'ok': True,
+                      'dip': f"0x{dip:02X}",
+                      'dip_patlite': bool(dip & 0x01),
+                      'dip_current': bool(dip & 0x02),
+                      'e220_addr': f"0x{data[4]:02X}{data[5]:02X}",
+                      'e220_ch': data[6],
+                      'air_rate': f"0x{data[7]:02X}",
+                      'tx_power': f"0x{data[8]:02X}"}
+        else:
+            result = {'ok': False, 'error': 'short response'}
+    else:
+        result = {'ok': False, 'error': 'unknown cmd'}
+
+    with g_res_lock:
+        g_results[req_id] = {'status': 'done', 'result': result,
+                              'machine': req['machine'], 'unit': req['unit'],
+                              'cmd': cmd, 'ts': _time.time()}
 
 
 def polling_loop():
@@ -176,16 +218,32 @@ def polling_loop():
                 print(f"[E220] {config['serial_port']} 接続")
                 while True:
                     t0 = _time.time()
-                    try:
-                        _handle_maint(ser, g_cmd_q.get_nowait())
-                    except queue.Empty:
-                        pass
+                    # メンテコマンドを優先処理（ポーリング前）
+                    while True:
+                        try:
+                            _handle_maint(ser, g_cmd_q.get_nowait())
+                        except queue.Empty:
+                            break
+                    # 通常ポーリング
                     for machine in config['machines']:
                         try:
                             poll_machine(ser, machine)
                         except Exception as e:
                             print(f"[E220] poll_machine({machine['name']}) エラー: {e}")
-                    _time.sleep(max(0, config['poll_interval_sec'] - (_time.time() - t0)))
+                    # ポーリング中に積まれたコマンドも処理
+                    while True:
+                        try:
+                            _handle_maint(ser, g_cmd_q.get_nowait())
+                        except queue.Empty:
+                            break
+                    # 残り時間スリープ（1秒ごとにキューを確認して早期起床）
+                    remaining = config['poll_interval_sec'] - (_time.time() - t0)
+                    deadline = _time.time() + max(0, remaining)
+                    while _time.time() < deadline:
+                        g_maint_event.clear()
+                        g_maint_event.wait(timeout=min(1.0, max(0, deadline - _time.time())))
+                        if not g_cmd_q.empty():
+                            break
         except Exception as e:
             print(f"[E220] {e}  5秒後に再接続…")
             _time.sleep(5)
@@ -1514,6 +1572,62 @@ def compat_hinmoku_info(date, hinmokuno):
     return redirect(url_for('show_hinmoku_info',
                             machine_name=_first_machine_name(),
                             date=date, hinmokuno=hinmokuno), 302)
+
+
+# ===== メンテナンス =====
+
+@app.route('/maintenance')
+def maintenance():
+    return render_template('maintenance.html', machines=config['machines'])
+
+
+@app.route('/api/maint', methods=['POST'])
+def api_maint():
+    body = request.get_json(force=True, silent=True) or {}
+    cmd     = body.get('cmd', '')
+    machine = body.get('machine', '')
+
+    if cmd not in ('K', 'V', 'H'):
+        return jsonify({'error': 'invalid cmd'}), 400
+
+    # 対象リスト構築
+    targets = []
+    for m in config['machines']:
+        if machine != 'all' and m['name'] != machine:
+            continue
+        targets.append({'machine': m['name'], 'unit': 'patlite', 'addr': m['patlite_addr']})
+        targets.append({'machine': m['name'], 'unit': 'current', 'addr': m['current_addr']})
+
+    if not targets:
+        return jsonify({'error': 'no matching machine'}), 404
+
+    req_ids = []
+    with g_res_lock:
+        for t in targets:
+            rid = str(uuid.uuid4())
+            g_results[rid] = {'status': 'pending'}
+            g_cmd_q.put({'req_id': rid, 'cmd': cmd,
+                         'addr': t['addr'], 'machine': t['machine'], 'unit': t['unit']})
+            req_ids.append(rid)
+
+    g_maint_event.set()
+
+    return jsonify({'req_ids': req_ids,
+                    'targets': [{'machine': t['machine'], 'unit': t['unit']}
+                                for t in targets]})
+
+
+@app.route('/api/maint/result/<req_id>')
+def api_maint_result(req_id):
+    with g_res_lock:
+        entry = g_results.get(req_id)
+        if entry is None:
+            return jsonify({'status': 'not_found'}), 404
+        # 5分以上経過した done 結果を削除（メモリ管理）
+        if entry.get('status') == 'done' and _time.time() - entry.get('ts', 0) > 300:
+            del g_results[req_id]
+            return jsonify({'status': 'not_found'}), 404
+        return jsonify(entry)
 
 
 if __name__ == "__main__":

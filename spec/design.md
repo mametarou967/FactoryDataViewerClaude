@@ -29,18 +29,32 @@ app.py
 ├─ polling_thread（daemon=True）
 │   ├─ 1分周期: 全機械を順次ポーリング（P/Cコマンド）
 │   ├─ データ統合 → CSV書き込み
-│   └─ コマンドキューを監視してメンテ操作を実行
-│         K(Ping) / H(HW情報) / V(バージョン) / U(OTA)
-│         → 結果をresult_queueに返す
+│   ├─ メンテコマンドキュー（g_cmd_q）を監視してメンテ操作を実行
+│   │     ・ポーリング前 + ポーリング後の2回ドレイン（取りこぼし防止）
+│   │     ・スリープ中も1秒ごとにキュー確認（g_maint_eventで早期起床）
+│   │     K(Ping) / H(HW情報) / V(バージョン) / U(OTA)
+│   │     → 結果を g_results dict に非同期保存（5分でGC）
+│   └─ 連続送信時: e220_recv後に300msウェイト（E220モジュール安定化）
 └─ Flask routes
-    ├─ /           監視画面（11台状態一覧）
-    ├─ /graph      時系列グラフ
-    ├─ /hinmoku    品目突合せ
-    └─ /maintenance メンテナンス画面
-        ├─ POST /api/ping      → cmd_queueにKコマンドを積む
-        ├─ POST /api/version   → cmd_queueにVコマンドを積む
-        ├─ POST /api/hwinfo    → cmd_queueにHコマンドを積む
-        └─ POST /api/ota       → cmd_queueにUコマンドを積む（Phase5）
+    ├─ /                                          監視画面（全機械状態一覧）
+    ├─ /machine/<name>/date/<date>/graph          日別時系列グラフ
+    ├─ /machine/<name>/date/<date>/overview       日俯瞰（サマリ+グラフ）
+    ├─ /machine/<name>/date/<date>/summary        稼働時間集計
+    ├─ /machine/<name>/date/<date>/table          生データテーブル
+    ├─ /machine/<name>/date/<date>/status         現在状態
+    ├─ /machine/<name>/date/<date>/hinmoku        品目一覧
+    ├─ /machine/<name>/date/<date>/hinmoku/<n>    品目グラフ
+    ├─ /machine/<name>/date/<date>/hinmoku/<n>/summary  品目稼働集計
+    ├─ /machine/<name>/month/<ym>/graph           月別グラフ
+    ├─ /machine/<name>/month/<ym>/overview        月俯瞰
+    ├─ /machine/<name>/month/<ym>/summary         月別稼働集計
+    ├─ /maintenance                       メンテナンス画面
+    ├─ POST /api/maint                   コマンド発行（K/V/H）→ g_cmd_qにエンキュー
+    │     body: {"cmd": "K"|"V"|"H", "machine": "<name>"|"all"}
+    │     response: {"req_ids": [...], "targets": [...]}
+    └─ GET  /api/maint/result/<req_id>   結果ポーリング
+          response: {"status": "pending"|"done", "result": {...}}
+          ※ OTA('U')コマンドはPhase5で追加
 ```
 
 - シリアルポート（E220）はpolling_threadが一元管理
@@ -387,7 +401,7 @@ K係数の実態（データシートK特性グラフより）:
      DC_OFFSET = 2048  (= 1.65V / 3.3V × 4096)
 3. RMS計算: v_rms = sqrt( sum(v_ac[i]^2) / N )
 4. 電圧換算: Vac_rms = v_rms × (3.3 / 4096)  [V]
-5. 電流換算: Io = Vac_rms × 20   [Arms]   ※ n/RL = 2000/100 = 20
+5. 電流換算: Io = Vac_rms × 60.6 [Arms]   ※ n/RL = 2000/33 ≈ 60.6  (R1=33Ω確定済み)
 ```
 
 ### ADC分解能と測定精度

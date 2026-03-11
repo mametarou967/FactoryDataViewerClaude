@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>メンテナンス — 工場ビューア</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 12px; }
+    a { text-decoration: none; }
+    .divider { margin: 0 6px; color: #888; }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid #ddd; padding: 6px 8px; white-space: nowrap; }
+    th { background: #f5f5f5; }
+    button { padding: 4px 10px; cursor: pointer; margin: 2px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-all { padding: 6px 14px; font-size: 14px; margin: 4px 4px 12px 0; }
+    .ok { color: #006600; font-weight: bold; }
+    .ng { color: #cc0000; font-weight: bold; }
+    #result-area { margin-top: 16px; }
+    #result-area table { width: 100%; }
+    .spinner { display: inline-block; width: 12px; height: 12px;
+               border: 2px solid #ccc; border-top-color: #555;
+               border-radius: 50%; animation: spin 0.6s linear infinite;
+               vertical-align: middle; margin-right: 4px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<p><a href="/">&larr; トップへ戻る</a></p>
+<h2 style="margin-top:0;">メンテナンス</h2>
+
+<div>
+  <button class="btn-all" id="btn-all-ping"    onclick="runAll('K')">全台 Ping</button>
+  <button class="btn-all" id="btn-all-version" onclick="runAll('V')">全台 バージョン</button>
+  <button class="btn-all" id="btn-all-hw"      onclick="runAll('H')">全台 HW情報</button>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>機械名</th>
+      <th>パトライト addr</th>
+      <th>電流 addr</th>
+      <th>操作</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for m in machines %}
+    <tr>
+      <td>{{ m.name }}</td>
+      <td>0x{{ '%04X' % m.patlite_addr }}</td>
+      <td>0x{{ '%04X' % m.current_addr }}</td>
+      <td>
+        <button onclick="runMachine('K', '{{ m.name }}', this)">Ping</button>
+        <button onclick="runMachine('V', '{{ m.name }}', this)">Version</button>
+        <button onclick="runMachine('H', '{{ m.name }}', this)">HW情報</button>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4">設定された機械がありません。</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div id="result-area"></div>
+
+<script>
+  const resultArea = document.getElementById('result-area');
+
+  // 全台ボタンをdisabled/enabled切り替え
+  const allBtns = ['btn-all-ping', 'btn-all-version', 'btn-all-hw'];
+  function setAllDisabled(flag) {
+    allBtns.forEach(id => { document.getElementById(id).disabled = flag; });
+  }
+
+  function cmdLabel(cmd) {
+    return cmd === 'K' ? 'Ping' : cmd === 'V' ? 'Version' : 'HW情報';
+  }
+
+  function runAll(cmd) {
+    setAllDisabled(true);
+    resultArea.innerHTML = '<span class="spinner"></span> 実行中…';
+    postMaint(cmd, 'all', null, () => setAllDisabled(false));
+  }
+
+  function runMachine(cmd, machine, btn) {
+    btn.disabled = true;
+    resultArea.innerHTML = '<span class="spinner"></span> 実行中…';
+    postMaint(cmd, machine, btn, () => { btn.disabled = false; });
+  }
+
+  function postMaint(cmd, machine, btn, done) {
+    fetch('/api/maint', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd: cmd, machine: machine})
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        resultArea.innerHTML = '<span class="ng">エラー: ' + escHtml(data.error) + '</span>';
+        done();
+        return;
+      }
+      pollResults(data.req_ids, data.targets, cmd, done);
+    })
+    .catch(e => {
+      resultArea.innerHTML = '<span class="ng">通信エラー: ' + escHtml(String(e)) + '</span>';
+      done();
+    });
+  }
+
+  function pollResults(reqIds, targets, cmd, done) {
+    const results = {};
+    let attempts = 0;
+    const maxAttempts = 20;  // 10秒
+
+    const timer = setInterval(() => {
+      attempts++;
+      const pending = reqIds.filter(id => !(id in results));
+      const fetches = pending.map(id =>
+        fetch('/api/maint/result/' + id)
+          .then(r => r.json())
+          .then(d => { if (d.status === 'done') results[id] = d; })
+          .catch(() => {})
+      );
+      Promise.all(fetches).then(() => {
+        if (Object.keys(results).length === reqIds.length || attempts >= maxAttempts) {
+          clearInterval(timer);
+          renderResults(reqIds, results, targets, cmd);
+          done();
+        }
+      });
+    }, 500);
+  }
+
+  function renderResults(reqIds, results, targets, cmd) {
+    let html = '<h3>' + escHtml(cmdLabel(cmd)) + ' 結果</h3>';
+
+    if (cmd === 'K') {
+      html += '<table><thead><tr><th>機械</th><th>ユニット</th><th>結果</th></tr></thead><tbody>';
+      reqIds.forEach((id, i) => {
+        const t = targets[i] || {};
+        const d = results[id];
+        const machine = escHtml(t.machine || '');
+        const unit    = escHtml(t.unit    || '');
+        if (!d) {
+          html += '<tr><td>' + machine + '</td><td>' + unit + '</td><td class="ng">timeout</td></tr>';
+        } else if (d.result && d.result.ok) {
+          html += '<tr><td>' + machine + '</td><td>' + unit + '</td><td class="ok">OK</td></tr>';
+        } else {
+          html += '<tr><td>' + machine + '</td><td>' + unit + '</td><td class="ng">'
+                + escHtml((d.result && d.result.error) || 'エラー') + '</td></tr>';
+        }
+      });
+      html += '</tbody></table>';
+
+    } else if (cmd === 'V') {
+      html += '<table><thead><tr><th>機械</th><th>ユニット</th><th>バージョン</th></tr></thead><tbody>';
+      reqIds.forEach((id, i) => {
+        const t = targets[i] || {};
+        const d = results[id];
+        const machine = escHtml(t.machine || '');
+        const unit    = escHtml(t.unit    || '');
+        if (!d) {
+          html += '<tr><td>' + machine + '</td><td>' + unit + '</td><td class="ng">timeout</td></tr>';
+        } else if (d.result && d.result.ok) {
+          html += '<tr><td>' + machine + '</td><td>' + unit + '</td><td class="ok">'
+                + escHtml(d.result.version) + '</td></tr>';
+        } else {
+          html += '<tr><td>' + machine + '</td><td>' + unit + '</td><td class="ng">'
+                + escHtml((d.result && d.result.error) || 'エラー') + '</td></tr>';
+        }
+      });
+      html += '</tbody></table>';
+
+    } else if (cmd === 'H') {
+      html += '<table><thead><tr>'
+            + '<th>機械</th><th>ユニット</th><th>DIP</th>'
+            + '<th>パトライトDIP</th><th>電流DIP</th>'
+            + '<th>E220アドレス</th><th>CH</th><th>AIR_RATE</th><th>TX_POWER</th>'
+            + '</tr></thead><tbody>';
+      reqIds.forEach((id, i) => {
+        const t = targets[i] || {};
+        const d = results[id];
+        const machine = escHtml(t.machine || '');
+        const unit    = escHtml(t.unit    || '');
+        if (!d) {
+          html += '<tr><td>' + machine + '</td><td>' + unit
+                + '</td><td colspan="7" class="ng">timeout</td></tr>';
+        } else if (d.result && d.result.ok) {
+          const r = d.result;
+          html += '<tr><td>' + machine + '</td><td>' + unit + '</td>'
+                + '<td>' + escHtml(r.dip)       + '</td>'
+                + '<td>' + (r.dip_patlite ? '✓' : '—') + '</td>'
+                + '<td>' + (r.dip_current ? '✓' : '—') + '</td>'
+                + '<td>' + escHtml(r.e220_addr)  + '</td>'
+                + '<td>' + escHtml(String(r.e220_ch)) + '</td>'
+                + '<td>' + escHtml(r.air_rate)   + '</td>'
+                + '<td>' + escHtml(r.tx_power)   + '</td>'
+                + '</tr>';
+        } else {
+          html += '<tr><td>' + machine + '</td><td>' + unit
+                + '</td><td colspan="7" class="ng">'
+                + escHtml((d.result && d.result.error) || 'エラー') + '</td></tr>';
+        }
+      });
+      html += '</tbody></table>';
+    }
+
+    resultArea.innerHTML = html;
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+</script>
+
+</body>
+</html>

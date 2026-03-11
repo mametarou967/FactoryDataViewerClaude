@@ -1,6 +1,6 @@
 # プロジェクト概要
 工場11台の機械を監視するシステム。エッジユニット（Pico+LoRa）→ ゲートウェイ（RPi5）→ Web表示。
-詳細仕様は `.steering/` を参照。
+詳細仕様は `spec/` を参照。
 
 ## 環境
 - ターゲットボード: Raspberry Pi Pico (RP2040)
@@ -64,5 +64,5 @@ gateway/
 hardware/         # KiCadスケマティック
 docs/             # データシート等（E220 JP版など）
 tools/            # 開発・設定・テスト用スクリプト（gw_e220_config.py, test_edge.py）
-.steering/        # 仕様・設計・タスク管理
+spec/             # 仕様・設計・タスク管理
 ```
