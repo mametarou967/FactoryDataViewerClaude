@@ -10,6 +10,7 @@ venv/
 # Gateway - generated data (CSVやグラフは管理対象外)
 gateway/data/
 gateway/static/*.png
+gateway/logs/
 
 # Arduino build
 build/
