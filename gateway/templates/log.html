@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>ログ — 工場ビューア</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 12px; max-width: 1000px; }
+    a { text-decoration: none; }
+    h2 { margin-top: 0; }
+    .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .toolbar label { font-size: 13px; color: #555; }
+    .toolbar select, .toolbar button { padding: 4px 10px; font-size: 13px; cursor: pointer; }
+    #auto-toggle { background: #1a73e8; color: #fff; border: none; border-radius: 4px; padding: 5px 14px; }
+    #auto-toggle.off { background: #888; }
+    #log-box {
+      background: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 12px;
+      padding: 10px; border-radius: 4px; height: 520px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .line-info    { color: #9cdcfe; }
+    .line-warning { color: #ce9178; }
+    .line-error   { color: #f44747; }
+    #status-bar { font-size: 12px; color: #888; margin-top: 6px; }
+  </style>
+</head>
+<body>
+
+<p><a href="/maintenance">&larr; メンテナンスへ戻る</a></p>
+<h2>ログ</h2>
+
+<div class="toolbar">
+  <label>表示行数:
+    <select id="n-select">
+      <option value="100">100行</option>
+      <option value="300" selected>300行</option>
+      <option value="500">500行</option>
+      <option value="1000">1000行</option>
+    </select>
+  </label>
+  <button id="auto-toggle" onclick="toggleAuto()">自動更新 ON</button>
+  <button onclick="loadLog()">今すぐ更新</button>
+</div>
+
+<div id="log-box"></div>
+<div id="status-bar">読み込み中...</div>
+
+<script>
+  let autoTimer = null;
+  let autoOn = true;
+
+  function toggleAuto() {
+    autoOn = !autoOn;
+    const btn = document.getElementById('auto-toggle');
+    if (autoOn) {
+      btn.textContent = '自動更新 ON';
+      btn.classList.remove('off');
+      startAuto();
+    } else {
+      btn.textContent = '自動更新 OFF';
+      btn.classList.add('off');
+      if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+    }
+  }
+
+  function startAuto() {
+    if (autoTimer) clearInterval(autoTimer);
+    autoTimer = setInterval(loadLog, 5000);
+  }
+
+  function loadLog() {
+    const n = document.getElementById('n-select').value;
+    fetch('/api/log?n=' + n)
+      .then(r => r.json())
+      .then(data => renderLog(data.lines))
+      .catch(e => {
+        document.getElementById('status-bar').textContent = '通信エラー: ' + e;
+      });
+  }
+
+  function renderLog(lines) {
+    const box = document.getElementById('log-box');
+    const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+
+    let html = '';
+    for (const line of lines) {
+      let cls = '';
+      if (/WARNING/.test(line))     cls = 'line-warning';
+      else if (/ERROR/.test(line))  cls = 'line-error';
+      else if (/INFO/.test(line))   cls = 'line-info';
+      html += '<div class="' + cls + '">' + escHtml(line) + '</div>';
+    }
+    box.innerHTML = html || '<div style="color:#666;">(ログなし)</div>';
+
+    if (wasAtBottom) box.scrollTop = box.scrollHeight;
+
+    const now = new Date().toLocaleTimeString('ja-JP');
+    document.getElementById('status-bar').textContent =
+      `${lines.length} 行表示 — 最終更新: ${now}`;
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  document.getElementById('n-select').addEventListener('change', loadLog);
+
+  // 初回ロード + 自動更新開始
+  loadLog();
+  startAuto();
+</script>
+
+</body>
+</html>

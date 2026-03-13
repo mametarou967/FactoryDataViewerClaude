@@ -22,11 +22,13 @@
                border-radius: 50%; animation: spin 0.6s linear infinite;
                vertical-align: middle; margin-right: 4px; }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .unit-patlite { color: #555; font-size: 12px; }
+    .unit-current { color: #555; font-size: 12px; }
   </style>
 </head>
 <body>
 
-<p><a href="/">&larr; トップへ戻る</a></p>
+<p><a href="/">&larr; トップへ戻る</a> &nbsp; <a href="/log">ログ &rarr;</a></p>
 <h2 style="margin-top:0;">メンテナンス</h2>
 
 <div>
@@ -39,21 +41,32 @@
   <thead>
     <tr>
       <th>機械名</th>
-      <th>パトライト addr</th>
-      <th>電流 addr</th>
+      <th>ユニット</th>
+      <th>addr</th>
       <th>操作</th>
     </tr>
   </thead>
   <tbody>
     {% for m in machines %}
     <tr>
-      <td>{{ m.name }}</td>
+      <td rowspan="2" style="vertical-align:middle;">{{ m.name }}</td>
+      <td class="unit-patlite">パトライト</td>
       <td>0x{{ '%04X' % m.patlite_addr }}</td>
+      <td>
+        <button onclick="runUnit('K', '{{ m.name }}', 'patlite', this)">K</button>
+        <button onclick="runUnit('V', '{{ m.name }}', 'patlite', this)">V</button>
+        <button onclick="runUnit('H', '{{ m.name }}', 'patlite', this)">H</button>
+        <button onclick="runUnit('P', '{{ m.name }}', 'patlite', this)">P(lux)</button>
+      </td>
+    </tr>
+    <tr>
+      <td class="unit-current">電流</td>
       <td>0x{{ '%04X' % m.current_addr }}</td>
       <td>
-        <button onclick="runMachine('K', '{{ m.name }}', this)">Ping</button>
-        <button onclick="runMachine('V', '{{ m.name }}', this)">Version</button>
-        <button onclick="runMachine('H', '{{ m.name }}', this)">HW情報</button>
+        <button onclick="runUnit('K', '{{ m.name }}', 'current', this)">K</button>
+        <button onclick="runUnit('V', '{{ m.name }}', 'current', this)">V</button>
+        <button onclick="runUnit('H', '{{ m.name }}', 'current', this)">H</button>
+        <button onclick="runUnit('C', '{{ m.name }}', 'current', this)">C(A)</button>
       </td>
     </tr>
     {% else %}
@@ -79,26 +92,27 @@
   }
 
   function cmdLabel(cmd) {
-    return cmd === 'K' ? 'Ping' : cmd === 'V' ? 'Version' : 'HW情報';
+    const labels = { K: 'Ping', V: 'Version', H: 'HW情報', P: 'Patlite lux', C: 'Current' };
+    return labels[cmd] || cmd;
   }
 
   function runAll(cmd) {
     setAllDisabled(true);
     resultArea.innerHTML = '<span class="spinner"></span> 実行中…';
-    postMaint(cmd, 'all', null, () => setAllDisabled(false));
+    postMaint(cmd, 'all', '', () => setAllDisabled(false));
   }
 
-  function runMachine(cmd, machine, btn) {
+  function runUnit(cmd, machine, unit, btn) {
     btn.disabled = true;
     resultArea.innerHTML = '<span class="spinner"></span> 実行中…';
-    postMaint(cmd, machine, btn, () => { btn.disabled = false; });
+    postMaint(cmd, machine, unit, () => { btn.disabled = false; });
   }
 
-  function postMaint(cmd, machine, btn, done) {
+  function postMaint(cmd, machine, unit, done) {
     fetch('/api/maint', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({cmd: cmd, machine: machine})
+      body: JSON.stringify({cmd: cmd, machine: machine, unit: unit})
     })
     .then(r => r.json())
     .then(data => {
@@ -207,6 +221,46 @@
         } else {
           html += '<tr><td>' + machine + '</td><td>' + unit
                 + '</td><td colspan="7" class="ng">'
+                + escHtml((d.result && d.result.error) || 'エラー') + '</td></tr>';
+        }
+      });
+      html += '</tbody></table>';
+
+    } else if (cmd === 'P') {
+      html += '<table><thead><tr><th>機械</th><th>赤 (lux)</th><th>黄 (lux)</th><th>緑 (lux)</th></tr></thead><tbody>';
+      reqIds.forEach((id, i) => {
+        const t = targets[i] || {};
+        const d = results[id];
+        const machine = escHtml(t.machine || '');
+        if (!d) {
+          html += '<tr><td>' + machine + '</td><td colspan="3" class="ng">timeout</td></tr>';
+        } else if (d.result && d.result.ok) {
+          const r = d.result;
+          html += '<tr><td>' + machine + '</td>'
+                + '<td>' + escHtml(String(r.red_lux))    + '</td>'
+                + '<td>' + escHtml(String(r.yellow_lux)) + '</td>'
+                + '<td>' + escHtml(String(r.green_lux))  + '</td>'
+                + '</tr>';
+        } else {
+          html += '<tr><td>' + machine + '</td><td colspan="3" class="ng">'
+                + escHtml((d.result && d.result.error) || 'エラー') + '</td></tr>';
+        }
+      });
+      html += '</tbody></table>';
+
+    } else if (cmd === 'C') {
+      html += '<table><thead><tr><th>機械</th><th>電流 (A)</th></tr></thead><tbody>';
+      reqIds.forEach((id, i) => {
+        const t = targets[i] || {};
+        const d = results[id];
+        const machine = escHtml(t.machine || '');
+        if (!d) {
+          html += '<tr><td>' + machine + '</td><td class="ng">timeout</td></tr>';
+        } else if (d.result && d.result.ok) {
+          html += '<tr><td>' + machine + '</td><td class="ok">'
+                + escHtml(d.result.current_A.toFixed(2)) + ' A</td></tr>';
+        } else {
+          html += '<tr><td>' + machine + '</td><td class="ng">'
                 + escHtml((d.result && d.result.error) || 'エラー') + '</td></tr>';
         }
       });

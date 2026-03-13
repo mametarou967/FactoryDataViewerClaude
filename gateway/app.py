@@ -3,6 +3,9 @@ import csv
 import os
 import struct
 import zlib
+import logging
+import logging.handlers
+import atexit
 from datetime import datetime, timedelta, time
 import time as _time
 import threading
@@ -88,6 +91,26 @@ def load_config(path=None):
 
 
 config = load_config()
+
+
+# ===== ログ設定 =====
+
+LOG_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+LOG_FILE = os.path.join(LOG_DIR, 'app.log')
+os.makedirs(LOG_DIR, exist_ok=True)
+
+_fh = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=5, encoding='utf-8')
+_fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+_ch = logging.StreamHandler()
+_ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+logger = logging.getLogger('gwapp')
+logger.setLevel(logging.INFO)
+logger.addHandler(_fh)
+logger.addHandler(_ch)
+
+logger.info('アプリ起動')
+atexit.register(lambda: logger.info('アプリ終了'))
 
 
 # ===== E220ドライバ =====
@@ -194,9 +217,11 @@ def poll_machine(ser, machine):
 
 def _handle_maint(ser, req):
     req_id = req['req_id']
-    cmd    = req['cmd']   # 'K' / 'V' / 'H'
+    cmd    = req['cmd']   # 'K' / 'V' / 'H' / 'P' / 'C'
     addr   = req['addr']  # int
     ch     = config['gw_channel']
+    machine = req['machine']
+    unit    = req['unit']
 
     e220_send(ser, addr, ch, cmd)
     data = e220_recv(ser)
@@ -225,12 +250,32 @@ def _handle_maint(ser, req):
                       'tx_power': f"0x{data[8]:02X}"}
         else:
             result = {'ok': False, 'error': 'short response'}
+    elif cmd == 'P':
+        # [ADDR_H][ADDR_L]['P'][R_H][R_L][Y_H][Y_L][G_H][G_L][CR][LF]
+        if data and len(data) >= 9 and data[2] == ord('P'):
+            result = {'ok': True,
+                      'red_lux':    (data[3] << 8) | data[4],
+                      'yellow_lux': (data[5] << 8) | data[6],
+                      'green_lux':  (data[7] << 8) | data[8]}
+        else:
+            result = {'ok': False, 'error': 'short response'}
+    elif cmd == 'C':
+        # [ADDR_H][ADDR_L]['C'][CUR_H][CUR_L][CR][LF]
+        if data and len(data) >= 5 and data[2] == ord('C'):
+            result = {'ok': True, 'current_A': ((data[3] << 8) | data[4]) / 100.0}
+        else:
+            result = {'ok': False, 'error': 'short response'}
     else:
         result = {'ok': False, 'error': 'unknown cmd'}
 
+    if result.get('ok'):
+        logger.info(f'MAINT {cmd} → 0x{addr:04X} ({machine}/{unit}): OK')
+    else:
+        logger.warning(f'MAINT {cmd} → 0x{addr:04X} ({machine}/{unit}): {result.get("error")}')
+
     with g_res_lock:
         g_results[req_id] = {'status': 'done', 'result': result,
-                              'machine': req['machine'], 'unit': req['unit'],
+                              'machine': machine, 'unit': unit,
                               'cmd': cmd, 'ts': _time.time()}
 
 
@@ -246,6 +291,7 @@ def polling_loop():
         try:
             with serial.Serial(config['serial_port'],
                                config['serial_baud'], timeout=0.1) as ser:
+                logger.info(f'E220接続: {config["serial_port"]}')
                 print(f"[E220] {config['serial_port']} 接続")
                 g_serial_obj = ser
                 while True:
@@ -282,6 +328,7 @@ def polling_loop():
                         if not g_cmd_q.empty():
                             break
         except Exception as e:
+            logger.warning(f'E220切断/エラー: {e}')
             print(f"[E220] {e}  5秒後に再接続…")
             g_serial_obj = None
             _time.sleep(5)
@@ -1640,6 +1687,10 @@ def _ota_worker(job_id, unit_addr, fw_bytes):
             g_ota_jobs[job_id].update({'progress': progress, 'status': status, 'message': message})
 
     update(0, 'running', 'OTA開始...')
+    with g_ota_lock:
+        job_info = g_ota_jobs.get(job_id, {})
+    logger.info(f'OTA開始: job={job_id[:8]} addr=0x{unit_addr:04X} size={total_size}B '
+                f'({job_info.get("machine","?")} / {job_info.get("unit","?")})')
 
     try:
         with serial_lock:
@@ -1691,9 +1742,11 @@ def _ota_worker(job_id, unit_addr, fw_bytes):
             if len(resp) < 4 or resp[2:4] != b'UD':
                 raise RuntimeError(f'FIN unexpected response: {resp!r}')
             update(100, 'done', 'OTA完了。エッジが再起動中...')
+            logger.info(f'OTA完了: job={job_id[:8]} addr=0x{unit_addr:04X}')
 
     except Exception as e:
         update(0, 'failed', str(e))
+        logger.error(f'OTA失敗: job={job_id[:8]} addr=0x{unit_addr:04X}: {e}')
 
 
 # ===== メンテナンス =====
@@ -1708,8 +1761,9 @@ def api_maint():
     body = request.get_json(force=True, silent=True) or {}
     cmd     = body.get('cmd', '')
     machine = body.get('machine', '')
+    unit    = body.get('unit', '')  # 'patlite' / 'current' / '' (両方)
 
-    if cmd not in ('K', 'V', 'H'):
+    if cmd not in ('K', 'V', 'H', 'P', 'C'):
         return jsonify({'error': 'invalid cmd'}), 400
 
     # 対象リスト構築
@@ -1717,8 +1771,10 @@ def api_maint():
     for m in config['machines']:
         if machine != 'all' and m['name'] != machine:
             continue
-        targets.append({'machine': m['name'], 'unit': 'patlite', 'addr': m['patlite_addr']})
-        targets.append({'machine': m['name'], 'unit': 'current', 'addr': m['current_addr']})
+        if unit == 'patlite' or (unit == '' and cmd != 'C'):
+            targets.append({'machine': m['name'], 'unit': 'patlite', 'addr': m['patlite_addr']})
+        if unit == 'current' or (unit == '' and cmd != 'P'):
+            targets.append({'machine': m['name'], 'unit': 'current', 'addr': m['current_addr']})
 
     if not targets:
         return jsonify({'error': 'no matching machine'}), 404
@@ -1838,6 +1894,25 @@ def ota_progress(job_id):
     # fw_bytes はレスポンスに含めない
     safe = {k: v for k, v in job.items() if k != 'fw_bytes'}
     return jsonify(safe)
+
+
+# ===== ログ画面 =====
+
+@app.route('/log')
+def log_page():
+    return render_template('log.html')
+
+
+@app.route('/api/log')
+def api_log():
+    n = request.args.get('n', 300, type=int)
+    lines = []
+    try:
+        with open(LOG_FILE, encoding='utf-8') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        pass
+    return jsonify({'lines': [l.rstrip() for l in lines[-n:]]})
 
 
 if __name__ == "__main__":
