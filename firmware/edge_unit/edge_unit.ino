@@ -1178,7 +1178,7 @@ static void handleUI(bool selPr, bool okPr, bool backPr) {
         case MODE_CONF_VIEW:
             // SEL: スクロール（0→1→0 循環）
             if (selPr) g_confScrollPos = (g_confScrollPos + 1) % 3;
-            if (backPr || okPr) { g_confScrollPos = 0; g_uiMode = MODE_MENU; }
+            if (backPr) { g_confScrollPos = 0; g_uiMode = MODE_MENU; }
             break;
 
         case MODE_EDIT_ADDH:
@@ -1214,18 +1214,11 @@ static void handleUI(bool selPr, bool okPr, bool backPr) {
             break;
 
         case MODE_TEST_PATLITE:
-            if (backPr || okPr) g_uiMode = MODE_MENU;
+            if (backPr) g_uiMode = MODE_MENU;
             break;
 
         case MODE_TEST_CURRENT:
-            if (selPr) {
-                // 新キャプチャ指示
-                mutex_enter_blocking(&g_mutex);
-                g_shared.wave_ready = false;
-                mutex_exit(&g_mutex);
-                g_wave_capture = true;
-            }
-            if (backPr || okPr) {
+            if (backPr) {
                 g_wave_capture = false;
                 g_uiMode = MODE_MENU;
             }
@@ -1272,15 +1265,17 @@ static void updateOLED() {
 
     switch (g_uiMode) {
         case MODE_NORMAL:
-            // line0: アドレス
+            // addr: サイズ2（大）で見やすく表示
+            g_oled.setTextSize(2);
             snprintf(buf, sizeof(buf), "addr:0x%02X%02X", g_e220.addH, g_e220.addL);
             g_oled.setCursor(0, 0);  g_oled.print(buf);
-            // line1: チャンネル + バージョン
-            snprintf(buf, sizeof(buf), "CH:%2d  v%d.%d.%d",
-                     g_e220.channel, FW_MAJOR, FW_MINOR, FW_PATCH);
-            g_oled.setCursor(0, 8);  g_oled.print(buf);
-            // line2: ユニット種別
-            g_oled.setCursor(0, 16);
+            // CH: サイズ2（大）で見やすく表示
+            snprintf(buf, sizeof(buf), "CH:%d", g_e220.channel);
+            g_oled.setCursor(0, 16); g_oled.print(buf);
+            // ユニット種別 + バージョン: サイズ1
+            g_oled.setTextSize(1);
+            snprintf(buf, sizeof(buf), "v%d.%d.%d", FW_MAJOR, FW_MINOR, FW_PATCH);
+            g_oled.setCursor(0, 34);
             if ((g_unit_type & (UNIT_PATLITE | UNIT_CURRENT)) == (UNIT_PATLITE | UNIT_CURRENT))
                 g_oled.print("patlite+cur");
             else if (g_unit_type & UNIT_PATLITE)
@@ -1289,7 +1284,8 @@ static void updateOLED() {
                 g_oled.print("current");
             else
                 g_oled.print("none");
-            // line7: ヒント
+            g_oled.setCursor(72, 34); g_oled.print(buf);  // バージョンを同行右側に
+            // ヒント
             g_oled.setCursor(0, 56); g_oled.print("[OK]Menu");
             break;
 
@@ -1350,7 +1346,7 @@ static void updateOLED() {
                 g_oled.print(lines[sp + i]);
             }
             g_oled.setCursor(0, 56);
-            g_oled.print("[SEL]scrl [BK]ret");
+            g_oled.print("[SEL]scrl [BK]back");
             break;
         }
 
@@ -1360,7 +1356,7 @@ static void updateOLED() {
             g_oled.setCursor(0, 16); g_oled.print(buf);
             snprintf(buf, sizeof(buf), "new: 0x%02X", g_editValue);
             g_oled.setCursor(0, 24); g_oled.print(buf);
-            g_oled.setCursor(0, 40); g_oled.print("[S]+1 [BK]-1");
+            g_oled.setCursor(0, 40); g_oled.print("[SEL]+1 [BK]-1");
             g_oled.setCursor(0, 48); g_oled.print("[OK]save");
             break;
 
@@ -1370,7 +1366,7 @@ static void updateOLED() {
             g_oled.setCursor(0, 16); g_oled.print(buf);
             snprintf(buf, sizeof(buf), "new: %d", g_editValue);
             g_oled.setCursor(0, 24); g_oled.print(buf);
-            g_oled.setCursor(0, 40); g_oled.print("[S]+1 [BK]-1");
+            g_oled.setCursor(0, 40); g_oled.print("[SEL]+1 [BK]-1");
             g_oled.setCursor(0, 48); g_oled.print("[OK]save");
             break;
 
@@ -1389,7 +1385,8 @@ static void updateOLED() {
             g_oled.setCursor(0, 24); g_oled.print(buf);
             snprintf(buf, sizeof(buf), "GRN: %.1flux", lux[2]);
             g_oled.setCursor(0, 32); g_oled.print(buf);
-            snprintf(buf, sizeof(buf), "ok:%c%c%c",
+            // tsl:YYY = 各TSL2561センサーの初期化状態（Y=正常 N=異常）
+            snprintf(buf, sizeof(buf), "tsl:%c%c%c",
                      g_tsl_ok[0]?'Y':'N', g_tsl_ok[1]?'Y':'N', g_tsl_ok[2]?'Y':'N');
             g_oled.setCursor(0, 40); g_oled.print(buf);
             g_oled.setCursor(0, 56); g_oled.print("[BK]exit");
@@ -1410,12 +1407,11 @@ static void updateOLED() {
             if (ready) {
                 drawWaveform(wave, 128, 0, 48);
             } else {
-                g_oled.setCursor(0, 16); g_oled.print("Press [SEL] to");
-                g_oled.setCursor(0, 24); g_oled.print("capture waveform");
+                g_oled.setCursor(0, 16); g_oled.print("Capturing...");
             }
             snprintf(buf, sizeof(buf), "RMS:%.2fA", rms);
             g_oled.setCursor(0, 48); g_oled.print(buf);
-            g_oled.setCursor(0, 56); g_oled.print("[S]cap [BK]ret");
+            g_oled.setCursor(0, 56); g_oled.print("[BK]exit");
             break;
         }
     }
