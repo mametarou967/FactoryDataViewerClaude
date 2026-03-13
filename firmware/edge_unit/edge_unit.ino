@@ -208,6 +208,9 @@ static E220Config g_e220 = {
     DESIRED_REG0, DESIRED_REG1, DESIRED_CHANNEL, DESIRED_REG3
 };
 
+// ===== Serial2 初期化済みフラグ =====
+static bool g_serial2_inited = false;
+
 // ===== AUX割り込みフラグ =====
 static volatile bool g_auxRise = false;
 static void onAuxRise() { g_auxRise = true; }
@@ -253,11 +256,22 @@ static bool     s_prev_capture      = false;
 static uint16_t s_wave_idx          = 0;
 
 // ===== Serial2 初期化ヘルパー =====
+// [注意] Serial2.end() → begin() の繰り返しは irq_set_exclusive_handler() で設定した
+//        ハンドラを irq_remove_handler() で除去する際に USB CDC (tud_task) の状態を
+//        破壊し、その後の delay() がハングする原因になる。
+//        このプロジェクトではボーレートは常に 9600bps 固定のため、
+//        初回のみ完全初期化し、2回目以降は RX バッファのクリアのみ行う。
 static void serial2Begin(uint32_t baud) {
-    Serial2.end();
-    Serial2.setTX(PIN_LORA_TX);
-    Serial2.setRX(PIN_LORA_RX);
-    Serial2.begin(baud);
+    if (!g_serial2_inited) {
+        // 初回のみ完全初期化（Serial2.end() は呼ばない）
+        Serial2.setTX(PIN_LORA_TX);
+        Serial2.setRX(PIN_LORA_RX);
+        Serial2.begin(baud);
+        g_serial2_inited = true;
+    } else {
+        // 2回目以降: RX バッファのみクリア（UART 再初期化は行わない）
+        while (Serial2.available()) Serial2.read();
+    }
     delay(50);
 }
 
@@ -1661,14 +1675,23 @@ void loop() {
 // ===== Core1 =====
 // Wire/センサーはCore0のsetup()で初期化済み。Core1はWireを排他的に使用する。
 void setup1() {
-    // Core1をflash操作中のロックアウトに対応させる
-    // (handleOtaInit等がmulticore_lockout_start_blockingを使うために必要)
-    multicore_lockout_victim_init();
-
     // Core0のsetup()完了を待ってからloop1()を開始する。
     // arduino-picoはCore0のsetup()より前にCore1を起動するため、
     // g_tsl_ok[]等の共有変数をCore0が初期化し終わるまで待つ必要がある。
-    while (!g_setup_done) delay(1);
+    //
+    // [注意] delay(1) は tud_task() を呼び出し Core1 から TinyUSB を触るため使用禁止。
+    //        また、multicore_lockout_victim_init() は irq_set_exclusive_handler() 経由で
+    //        IRQ テーブル用 spinlock(14) を取得するが、setup() 内の Serial2.begin() も
+    //        同じ spinlock を取得するためデッドロックする。
+    //        → setup() 完了後（g_setup_done=true）に multicore_lockout_victim_init を呼ぶ。
+    while (!g_setup_done) {
+        tight_loop_contents();  // tud_task を呼ばない・CPUを占有するが setup 完了まで短時間
+    }
+
+    // Core1をflash操作中のロックアウトに対応させる
+    // (handleOtaInit等がmulticore_lockout_start_blockingを使うために必要)
+    // setup()完了後に呼ぶことで Serial2.begin() との irq spinlock 競合を回避
+    multicore_lockout_victim_init();
 }
 
 void loop1() {
