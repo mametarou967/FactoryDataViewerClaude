@@ -977,21 +977,31 @@ static void processCommand() {
 
     // OTA DATAパケット(UD...)はCRLF終端なし・最大135B
     // 通常パケットはCRLF終端あり・最大32B
-    // 受信判定: CRLF検出 または タイムアウト(OTA時は250ms)
-    uint32_t timeout = 100;
+    // 受信判定:
+    //   OTA DATA ('U','D'): dlenバイト受信完了で終了（CRLFチェックは行わない）
+    //   通常パケット: CRLF検出で終了
+    // ※ファームウェアバイナリには 0x0D 0x0A が任意の位置に現れるため、
+    //   OTA DATAパケット受信中はCRLF誤検出を避ける必要がある
+    uint32_t timeout   = 100;
+    bool     is_ota_data = false;
     while (len < (int)sizeof(buf)) {
         if (Serial2.available()) {
             uint8_t b = Serial2.read();
             buf[len++] = b;
-            // 先頭2バイト確定後にタイムアウトを調整
+            // 先頭2バイト確定後にOTA DATAパケットを識別してタイムアウト延長
             if (len == 2 && buf[0] == 'U' && buf[1] == 'D') {
-                timeout = 250;  // OTA DATAパケット用に延長
+                timeout      = 250;  // OTA DATAパケット用に延長
+                is_ota_data  = true;
             }
-            if (len >= 3 && buf[len - 2] == '\r' && buf[len - 1] == '\n') break;
-            // OTA DATAパケット: len(buf[6])バイト分のdataを受信し終えたら完了
-            if (len >= 7 && buf[0] == 'U' && buf[1] == 'D') {
-                uint8_t dlen = buf[6];
-                if (len >= 7 + (int)dlen) break;
+            if (is_ota_data) {
+                // OTA DATA: dlenバイト受信完了で終了（CRLFチェック禁止）
+                if (len >= 7) {
+                    uint8_t dlen = buf[6];
+                    if (len >= 7 + (int)dlen) break;
+                }
+            } else {
+                // 通常パケット: CRLF終端で終了
+                if (len >= 3 && buf[len - 2] == '\r' && buf[len - 1] == '\n') break;
             }
         }
         if (millis() - t > timeout) break;
