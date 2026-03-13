@@ -32,7 +32,6 @@
 #include <pico/mutex.h>
 #include "hardware/flash.h"
 #include "hardware/sync.h"
-#include "pico/multicore.h"
 
 // ===== UIモード（インクルード直後に定義: Arduino自動プロトタイプ生成との衝突防止） =====
 enum UIMode : uint8_t {
@@ -214,6 +213,31 @@ static bool g_serial2_inited = false;
 // ===== AUX割り込みフラグ =====
 static volatile bool g_auxRise = false;
 static void onAuxRise() { g_auxRise = true; }
+
+// ===== Core1 協調的一時停止（flash操作中の安全停止） =====
+// multicore_lockout_victim_init() は arduino-pico の SIO_IRQ_PROC1 ハンドラと衝突して
+// Core1 を panic させるため使用不可。代わりに volatile フラグで協調停止する。
+static volatile bool g_core1_pause_req = false;  // Core0→Core1: 停止要求
+static volatile bool g_core1_paused    = false;  // Core1→Core0: 停止確認
+
+// RAM常駐: Core1 は flash 操作中ここでスピン（XIP 無効中でも安全）
+void __no_inline_not_in_flash_func(core1ParkInRam)(void) {
+    g_core1_paused = true;
+    while (g_core1_pause_req) tight_loop_contents();
+    g_core1_paused = false;
+}
+
+// Core0 用: Core1 が RAM に退避するまで待つ（200ms タイムアウト）
+static void requestCore1Pause() {
+    g_core1_pause_req = true;
+    uint32_t t = millis();
+    while (!g_core1_paused && (millis() - t < 200)) tight_loop_contents();
+}
+
+// Core0 用: Core1 を再開させる
+static void releaseCore1() {
+    g_core1_pause_req = false;
+}
 
 // ===== SSD1306 OLEDオブジェクト =====
 static Adafruit_SSD1306 g_oled(OLED_W, OLED_H, &Wire1, -1);
@@ -693,21 +717,21 @@ static void otaWriteMagic(uint32_t fw_size) {
     p[11] = (fw_size >>  8) & 0xFF;
     p[12] = (fw_size >>  0) & 0xFF;
 
+    requestCore1Pause();
     uint32_t ints = save_and_disable_interrupts();
-    multicore_lockout_start_blocking();
     flash_range_program(page_off, magic_buf, FLASH_PAGE_SIZE);
-    multicore_lockout_end_blocking();
     restore_interrupts(ints);
+    releaseCore1();
 }
 
 // ===== OTA: Bank B マジック消去 =====
 static void otaClearMagic() {
     uint32_t page_off = OTA_MAGIC_OFFSET & ~(FLASH_SECTOR_SIZE - 1);
+    requestCore1Pause();
     uint32_t ints = save_and_disable_interrupts();
-    multicore_lockout_start_blocking();
     flash_range_erase(page_off, FLASH_SECTOR_SIZE);
-    multicore_lockout_end_blocking();
     restore_interrupts(ints);
+    releaseCore1();
 }
 
 // ===== OTA ハンドラ =====
@@ -793,11 +817,11 @@ static void handleOtaInit(const uint8_t *buf, int len) {
     Serial.printf("[OTA] INIT total=%lu crc32=0x%08lX\n", total_size, total_crc32);
 
     // Bank B 全体を消去（Core1停止中に実行）
+    requestCore1Pause();
     uint32_t ints = save_and_disable_interrupts();
-    multicore_lockout_start_blocking();
     flash_range_erase(OTA_BANK_OFFSET, OTA_MAX_FIRMWARE);
-    multicore_lockout_end_blocking();
     restore_interrupts(ints);
+    releaseCore1();
 
     g_ota.state          = OTA_RECV;
     g_ota.total_size     = total_size;
@@ -869,11 +893,11 @@ static void handleOtaData(const uint8_t *buf, int pktlen) {
             memset(g_ota.page_buf + g_ota.page_fill, 0xFF,
                    FLASH_PAGE_SIZE - g_ota.page_fill);
         }
+        requestCore1Pause();
         uint32_t ints = save_and_disable_interrupts();
-        multicore_lockout_start_blocking();
         flash_range_program(g_ota.page_base_off, g_ota.page_buf, FLASH_PAGE_SIZE);
-        multicore_lockout_end_blocking();
         restore_interrupts(ints);
+        releaseCore1();
         g_ota.page_fill = 0;
     }
 
@@ -927,8 +951,8 @@ static void handleOtaFin(const uint8_t *buf, int len) {
 
     // 少し待ってから再起動（GWがDONEを受け取れるように）
     delay(500);
+    requestCore1Pause();  // Core1 を RAM に退避させてから flash 操作
     uint32_t ints = save_and_disable_interrupts();
-    multicore_lockout_start_blocking();
     applyOTA_impl(g_ota.total_size);
     // ここには戻らない
 }
@@ -1693,14 +1717,13 @@ void setup1() {
 }
 
 void loop1() {
-    // Core1をflash操作中のロックアウトに対応させる（初回のみ）
-    // setup1() ではなく loop1() 初回で呼ぶことで、setup() の Serial2.begin() との
-    // タイミング競合（Serial2.begin() ハング / Core1 起動不能）を回避する。
-    // OTAコマンドはLoRa経由で届くため、このloop1()初回実行より後になる。
-    static bool s_lockout_inited = false;
-    if (!s_lockout_inited) {
-        multicore_lockout_victim_init();
-        s_lockout_inited = true;
+    // flash操作中の協調的一時停止チェック
+    // Core0がrequestCore1Pause()を呼んだ場合、RAMに退避してスピン待機する。
+    // multicore_lockout_victim_init() は arduino-pico の SIO_IRQ_PROC1 ハンドラと
+    // 衝突して Core1 を panic させるため使用しない。
+    if (g_core1_pause_req) {
+        core1ParkInRam();
+        return;
     }
 
     bool did_heartbeat = false;
