@@ -164,7 +164,7 @@ static const uint8_t PIN_LED_D1    = 28;
 
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
-static const uint8_t FW_MINOR = 0;
+static const uint8_t FW_MINOR = 1;
 static const uint8_t FW_PATCH = 0;
 
 // ===== Error Codes =====
