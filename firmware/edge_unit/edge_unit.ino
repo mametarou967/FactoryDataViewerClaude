@@ -1679,22 +1679,30 @@ void setup1() {
     // arduino-picoはCore0のsetup()より前にCore1を起動するため、
     // g_tsl_ok[]等の共有変数をCore0が初期化し終わるまで待つ必要がある。
     //
-    // [注意] delay(1) は tud_task() を呼び出し Core1 から TinyUSB を触るため使用禁止。
-    //        また、multicore_lockout_victim_init() は irq_set_exclusive_handler() 経由で
-    //        IRQ テーブル用 spinlock(14) を取得するが、setup() 内の Serial2.begin() も
-    //        同じ spinlock を取得するためデッドロックする。
-    //        → setup() 完了後（g_setup_done=true）に multicore_lockout_victim_init を呼ぶ。
+    // [注意] delay(1) は内部で tud_task() を呼び出し、Core1 から TinyUSB を触ることになる。
+    //        Core0 も delay()/Serial.println() で tud_task() を呼ぶため、
+    //        両コアが同時に tud_task() を呼ぶと USB CDC 状態が破壊され Serial2.begin() 等が
+    //        ハングする原因になる。tight_loop_contents() に変更して競合を排除する。
+    //
+    // [注意2] multicore_lockout_victim_init() は setup1() のここで呼ぶと Serial2.begin() を
+    //         ハングさせる(先頭)か Core1 を起動不能にする(末尾)。
+    //         loop1() の初回実行時に呼ぶことで両問題を回避する。
     while (!g_setup_done) {
-        tight_loop_contents();  // tud_task を呼ばない・CPUを占有するが setup 完了まで短時間
+        tight_loop_contents();  // tud_task を呼ばない
     }
-
-    // Core1をflash操作中のロックアウトに対応させる
-    // (handleOtaInit等がmulticore_lockout_start_blockingを使うために必要)
-    // setup()完了後に呼ぶことで Serial2.begin() との irq spinlock 競合を回避
-    multicore_lockout_victim_init();
 }
 
 void loop1() {
+    // Core1をflash操作中のロックアウトに対応させる（初回のみ）
+    // setup1() ではなく loop1() 初回で呼ぶことで、setup() の Serial2.begin() との
+    // タイミング競合（Serial2.begin() ハング / Core1 起動不能）を回避する。
+    // OTAコマンドはLoRa経由で届くため、このloop1()初回実行より後になる。
+    static bool s_lockout_inited = false;
+    if (!s_lockout_inited) {
+        multicore_lockout_victim_init();
+        s_lockout_inited = true;
+    }
+
     bool did_heartbeat = false;
 
     // === パトライト: TSL2561 高速サイクリング（~45ms/3ch） ===
