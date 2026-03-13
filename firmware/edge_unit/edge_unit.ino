@@ -1265,27 +1265,36 @@ static void updateOLED() {
 
     switch (g_uiMode) {
         case MODE_NORMAL:
-            // addr: サイズ2（大）で見やすく表示
-            g_oled.setTextSize(2);
-            snprintf(buf, sizeof(buf), "addr:0x%02X%02X", g_e220.addH, g_e220.addL);
-            g_oled.setCursor(0, 0);  g_oled.print(buf);
-            // CH: サイズ2（大）で見やすく表示
-            snprintf(buf, sizeof(buf), "CH:%d", g_e220.channel);
-            g_oled.setCursor(0, 16); g_oled.print(buf);
-            // ユニット種別 + バージョン: サイズ1
+            // ラベル(size1)+値(size2) 分離レイアウト（128px幅に収める）
+            // "addr:0x0101"はsize2で11文字×12px=132px>128pxになるため分割
+            // y=0-7:   "Addr:"       size1
+            // y=8-23:  "0xMMTT"      size2  6chars×12px=72px
+            // y=24-31: "CH:"         size1
+            // y=32-47: "<ch>"        size2  最大2chars×12px=24px
+            // y=48-55: unit+ver      size1
+            // y=56-63: "[OK]Menu"    size1
             g_oled.setTextSize(1);
-            snprintf(buf, sizeof(buf), "v%d.%d.%d", FW_MAJOR, FW_MINOR, FW_PATCH);
-            g_oled.setCursor(0, 34);
+            g_oled.setCursor(0, 0);  g_oled.print("Addr:");
+            g_oled.setTextSize(2);
+            snprintf(buf, sizeof(buf), "0x%02X%02X", g_e220.addH, g_e220.addL);
+            g_oled.setCursor(0, 8);  g_oled.print(buf);
+            g_oled.setTextSize(1);
+            g_oled.setCursor(0, 24); g_oled.print("CH:");
+            g_oled.setTextSize(2);
+            snprintf(buf, sizeof(buf), "%d", g_e220.channel);
+            g_oled.setCursor(0, 32); g_oled.print(buf);
+            g_oled.setTextSize(1);
+            g_oled.setCursor(0, 48);
             if ((g_unit_type & (UNIT_PATLITE | UNIT_CURRENT)) == (UNIT_PATLITE | UNIT_CURRENT))
-                g_oled.print("patlite+cur");
+                g_oled.print("pat+cur");
             else if (g_unit_type & UNIT_PATLITE)
                 g_oled.print("patlite");
             else if (g_unit_type & UNIT_CURRENT)
                 g_oled.print("current");
             else
                 g_oled.print("none");
-            g_oled.setCursor(72, 34); g_oled.print(buf);  // バージョンを同行右側に
-            // ヒント
+            snprintf(buf, sizeof(buf), "v%d.%d.%d", FW_MAJOR, FW_MINOR, FW_PATCH);
+            g_oled.setCursor(60, 48); g_oled.print(buf);
             g_oled.setCursor(0, 56); g_oled.print("[OK]Menu");
             break;
 
