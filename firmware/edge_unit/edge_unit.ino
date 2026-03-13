@@ -850,6 +850,7 @@ static void handleOtaData(const uint8_t *buf, int pktlen) {
     uint16_t rcrc16   = ((uint16_t)buf[4] << 8) | buf[5];
     uint8_t  dlen     = buf[6];
 
+    Serial.printf("[OTA-D] pktlen=%d dlen=%d (need=%d)\n", pktlen, (int)dlen, 7+(int)dlen);
     if (pktlen < 7 + (int)dlen) { sendOtaNack(seq, 0x12); return; }
 
     const uint8_t *data = buf + 7;
