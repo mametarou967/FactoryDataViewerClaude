@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>OTA ファームウェア更新 — 工場ビューア</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 12px; max-width: 800px; }
+    a { text-decoration: none; }
+    h2 { margin-top: 0; }
+    label { display: block; margin: 8px 0 4px; font-weight: bold; }
+    select, input[type=file] { padding: 4px 8px; font-size: 14px; }
+    .btn {
+      display: inline-block; padding: 8px 18px; font-size: 14px;
+      border: none; border-radius: 4px; cursor: pointer; margin: 4px 4px 4px 0;
+    }
+    .btn-upload  { background: #5cb85c; color: #fff; }
+    .btn-start   { background: #1a73e8; color: #fff; }
+    .btn-abort   { background: #cc0000; color: #fff; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #progress-wrap { margin-top: 16px; display: none; }
+    #progress-bar-outer {
+      background: #ddd; border-radius: 4px; height: 20px;
+      width: 100%; margin: 8px 0;
+    }
+    #progress-bar-inner {
+      background: #1a73e8; border-radius: 4px; height: 20px;
+      width: 0%; transition: width 0.3s;
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-size: 12px; font-weight: bold;
+    }
+    #status-msg { margin: 4px 0; color: #333; }
+    #status-msg.ok   { color: #006600; font-weight: bold; }
+    #status-msg.fail { color: #cc0000; font-weight: bold; }
+    .notice {
+      background: #fff3cd; border-left: 4px solid #ffc107;
+      padding: 10px 14px; margin: 16px 0; font-size: 13px;
+    }
+    .notice ul { margin: 4px 0; padding-left: 18px; }
+    .timing-table { border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    .timing-table th, .timing-table td { border: 1px solid #ddd; padding: 4px 10px; }
+    .timing-table th { background: #f5f5f5; }
+  </style>
+</head>
+<body>
+
+<p><a href="/maintenance">&larr; メンテナンスへ戻る</a></p>
+<h2>OTA ファームウェア更新</h2>
+
+<div class="notice">
+  <strong>注意事項</strong>
+  <ul>
+    <li>OTA中はエッジユニットのセンサー収集が一時停止します</li>
+    <li>OTA完了後、エッジは自動的に再起動します（約30秒）</li>
+    <li>通信エラー発生時は「中止」ボタンを押してからやり直してください</li>
+    <li>ファイルは Arduino IDE でビルドした <code>.bin</code> ファイル（最大1MB）を使用してください</li>
+  </ul>
+</div>
+
+<!-- 設定フォーム -->
+<div id="form-section">
+  <label for="sel-machine">機械選択:</label>
+  <select id="sel-machine">
+    {% for m in machines %}
+    <option value="{{ m.name }}"
+            data-patlite="0x{{ '%04X' % m.patlite_addr }}"
+            data-current="0x{{ '%04X' % m.current_addr }}">
+      {{ m.name }}
+    </option>
+    {% else %}
+    <option disabled>設定された機械がありません</option>
+    {% endfor %}
+  </select>
+
+  <label for="sel-unit">ユニット:</label>
+  <select id="sel-unit">
+    <option value="patlite">パトライト監視ユニット (patlite)</option>
+    <option value="current">電流監視ユニット (current)</option>
+  </select>
+
+  <div id="addr-display" style="margin: 6px 0; color: #555; font-size: 13px;"></div>
+
+  <label for="fw-file">ファームウェアファイル (.bin):</label>
+  <input type="file" id="fw-file" accept=".bin">
+  <div id="file-info" style="margin: 4px 0; color: #555; font-size: 13px;"></div>
+
+  <br>
+  <button class="btn btn-upload" id="btn-upload" onclick="doUpload()" disabled>アップロード</button>
+  <button class="btn btn-start"  id="btn-start"  onclick="doStart()"  disabled>OTA 開始</button>
+</div>
+
+<!-- 進捗表示 -->
+<div id="progress-wrap">
+  <h3 style="margin: 12px 0 4px;">進捗</h3>
+  <div id="progress-bar-outer">
+    <div id="progress-bar-inner">0%</div>
+  </div>
+  <div id="status-msg">待機中...</div>
+  <br>
+  <button class="btn btn-abort" id="btn-abort" onclick="doAbort()" disabled>中止</button>
+</div>
+
+<!-- 所要時間目安 -->
+<h3 style="margin-top: 24px;">所要時間の目安</h3>
+<table class="timing-table">
+  <thead><tr><th>ファームサイズ</th><th>チャンク数</th><th>推定時間</th></tr></thead>
+  <tbody>
+    <tr><td>20 KB</td><td>156</td><td>約 4 分</td></tr>
+    <tr><td>100 KB</td><td>781</td><td>約 20 分</td></tr>
+    <tr><td>200 KB</td><td>1563</td><td>約 39 分</td></tr>
+  </tbody>
+</table>
+<p style="font-size:12px; color:#888;">RTT 約 1.5 秒/チャンク（SF6/BW125kHz、9375bps）、深夜バッチ or 手動メンテ窓での実行を推奨</p>
+
+<script>
+  let g_jobId = null;
+  let g_pollTimer = null;
+
+  // アドレス表示更新
+  function updateAddrDisplay() {
+    const sel  = document.getElementById('sel-machine');
+    const unit = document.getElementById('sel-unit').value;
+    const opt  = sel.options[sel.selectedIndex];
+    if (!opt) return;
+    const addr = unit === 'patlite' ? opt.dataset.patlite : opt.dataset.current;
+    document.getElementById('addr-display').textContent = `対象アドレス: ${addr}`;
+  }
+
+  document.getElementById('sel-machine').addEventListener('change', updateAddrDisplay);
+  document.getElementById('sel-unit').addEventListener('change', updateAddrDisplay);
+  updateAddrDisplay();
+
+  // ファイル選択時にアップロードボタンを有効化
+  document.getElementById('fw-file').addEventListener('change', function() {
+    const f = this.files[0];
+    if (f) {
+      const kb = (f.size / 1024).toFixed(1);
+      const chunks = Math.ceil(f.size / 128);
+      document.getElementById('file-info').textContent =
+        `${f.name}  (${kb} KB, 約 ${chunks} チャンク)`;
+      document.getElementById('btn-upload').disabled = false;
+    } else {
+      document.getElementById('file-info').textContent = '';
+      document.getElementById('btn-upload').disabled = true;
+    }
+    document.getElementById('btn-start').disabled = true;
+    g_jobId = null;
+  });
+
+  function setMsg(msg, cls) {
+    const el = document.getElementById('status-msg');
+    el.textContent = msg;
+    el.className = cls || '';
+  }
+
+  function setProgress(pct) {
+    const bar = document.getElementById('progress-bar-inner');
+    bar.style.width = pct + '%';
+    bar.textContent = pct + '%';
+  }
+
+  // アップロード
+  function doUpload() {
+    const f       = document.getElementById('fw-file').files[0];
+    const machine = document.getElementById('sel-machine').value;
+    const unit    = document.getElementById('sel-unit').value;
+    if (!f) { alert('ファイルを選択してください'); return; }
+
+    document.getElementById('btn-upload').disabled = true;
+    document.getElementById('btn-start').disabled  = true;
+    document.getElementById('progress-wrap').style.display = 'block';
+    setProgress(0);
+    setMsg('アップロード中...');
+
+    const fd = new FormData();
+    fd.append('firmware', f);
+    fd.append('machine', machine);
+    fd.append('unit', unit);
+
+    fetch('/api/ota/upload', { method: 'POST', body: fd })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) {
+          setMsg('アップロード失敗: ' + escHtml(data.error), 'fail');
+          document.getElementById('btn-upload').disabled = false;
+          return;
+        }
+        g_jobId = data.job_id;
+        const kb = (data.fw_size / 1024).toFixed(1);
+        setMsg(`アップロード完了 (${kb} KB, job=${g_jobId.slice(0,8)}...)。OTA開始ボタンを押してください。`);
+        document.getElementById('btn-start').disabled = false;
+        document.getElementById('btn-upload').disabled = false;
+      })
+      .catch(e => {
+        setMsg('通信エラー: ' + escHtml(String(e)), 'fail');
+        document.getElementById('btn-upload').disabled = false;
+      });
+  }
+
+  // OTA開始
+  function doStart() {
+    if (!g_jobId) { alert('先にファームウェアをアップロードしてください'); return; }
+    if (!confirm('OTAを開始します。OTA中はセンサー収集が停止します。続行しますか？')) return;
+
+    document.getElementById('btn-start').disabled = true;
+    document.getElementById('btn-upload').disabled = true;
+    document.getElementById('btn-abort').disabled  = false;
+    setMsg('OTA送信中...');
+
+    fetch('/api/ota/start/' + g_jobId, { method: 'POST' })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) {
+          setMsg('OTA開始失敗: ' + escHtml(data.error), 'fail');
+          document.getElementById('btn-start').disabled  = false;
+          document.getElementById('btn-abort').disabled  = true;
+          return;
+        }
+        startPolling();
+      })
+      .catch(e => {
+        setMsg('通信エラー: ' + escHtml(String(e)), 'fail');
+        document.getElementById('btn-start').disabled = false;
+        document.getElementById('btn-abort').disabled = true;
+      });
+  }
+
+  // 進捗ポーリング
+  function startPolling() {
+    if (g_pollTimer) clearInterval(g_pollTimer);
+    g_pollTimer = setInterval(() => {
+      if (!g_jobId) return;
+      fetch('/api/ota/progress/' + g_jobId)
+        .then(r => r.json())
+        .then(data => {
+          setProgress(data.progress || 0);
+          if (data.status === 'done') {
+            clearInterval(g_pollTimer);
+            setMsg('✔ ' + escHtml(data.message || 'OTA完了'), 'ok');
+            document.getElementById('btn-abort').disabled = true;
+          } else if (data.status === 'failed') {
+            clearInterval(g_pollTimer);
+            setMsg('✘ 失敗: ' + escHtml(data.message || '不明なエラー'), 'fail');
+            document.getElementById('btn-start').disabled  = false;
+            document.getElementById('btn-upload').disabled = false;
+            document.getElementById('btn-abort').disabled  = true;
+          } else {
+            setMsg(escHtml(data.message || '送信中...'));
+          }
+        })
+        .catch(() => {});
+    }, 1000);
+  }
+
+  // 中止（ABORT コマンドは未実装のため UI レベルでのキャンセルのみ）
+  function doAbort() {
+    if (!confirm('OTAを中止しますか？エッジは中途半端な状態になる場合があります。')) return;
+    if (g_pollTimer) clearInterval(g_pollTimer);
+    setMsg('中止しました。エッジを手動で再起動してください。', 'fail');
+    document.getElementById('btn-abort').disabled  = true;
+    document.getElementById('btn-start').disabled  = false;
+    document.getElementById('btn-upload').disabled = false;
+    g_jobId = null;
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+</script>
+
+</body>
+</html>

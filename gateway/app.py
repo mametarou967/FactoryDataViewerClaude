@@ -1,6 +1,8 @@
 from flask import Flask, render_template, abort, send_file, redirect, url_for, jsonify, request
 import csv
 import os
+import struct
+import zlib
 from datetime import datetime, timedelta, time
 import time as _time
 import threading
@@ -109,6 +111,28 @@ def e220_recv(ser, timeout_sec=2.5):
     return None
 
 
+def crc16_ccitt(data: bytes) -> int:
+    """CRC16-CCITT (poly=0x1021, init=0xFFFF)"""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = (crc << 1) ^ 0x1021 if crc & 0x8000 else crc << 1
+    return crc & 0xFFFF
+
+
+def e220_send_payload(ser, addr: int, ch: int, payload: bytes):
+    """任意バイト列を E220 固定アドレスモードで送信（最大200バイト）"""
+    addrH = (addr >> 8) & 0xFF
+    addrL = addr & 0xFF
+    packet = bytes([addrH, addrL, ch]) + payload
+    ser.write(packet)
+    # AUX HIGH 待ち相当（200msポーリング）
+    deadline = _time.time() + 2.0
+    while _time.time() < deadline:
+        _time.sleep(0.02)
+
+
 def parse_patlite(data):
     # [ADDR_H][ADDR_L]['P'][R_H][R_L][Y_H][Y_L][G_H][G_L][CR][LF]
     if data and len(data) >= 9 and data[2] == ord('P'):
@@ -144,6 +168,12 @@ g_cmd_q     = queue.Queue()
 g_results   = {}               # {req_id: {'status': 'pending'|'done', ...}}
 g_res_lock  = threading.Lock()
 g_maint_event = threading.Event()  # Flaskがコマンドを積んだらセット → polling_loopが早期起床
+
+# ===== OTA グローバル =====
+serial_lock  = threading.Lock()   # ポーリングスレッドとOTAワーカーの排他制御
+g_ota_jobs   = {}                  # {job_id: {status, progress, message, fw_bytes, ...}}
+g_ota_lock   = threading.Lock()
+g_serial_obj = None                # polling_loop が開いているシリアルオブジェクト（OTA共用）
 
 
 def poll_machine(ser, machine):
@@ -205,6 +235,7 @@ def _handle_maint(ser, req):
 
 
 def polling_loop():
+    global g_serial_obj
     if not HAS_SERIAL:
         print("[E220] pyserial がインストールされていません。ポーリングを無効化します。")
         return
@@ -216,26 +247,32 @@ def polling_loop():
             with serial.Serial(config['serial_port'],
                                config['serial_baud'], timeout=0.1) as ser:
                 print(f"[E220] {config['serial_port']} 接続")
+                g_serial_obj = ser
                 while True:
+                    # OTAワーカーが動作中はポーリングをスキップ
+                    if serial_lock.locked():
+                        _time.sleep(1.0)
+                        continue
                     t0 = _time.time()
-                    # メンテコマンドを優先処理（ポーリング前）
-                    while True:
-                        try:
-                            _handle_maint(ser, g_cmd_q.get_nowait())
-                        except queue.Empty:
-                            break
-                    # 通常ポーリング
-                    for machine in config['machines']:
-                        try:
-                            poll_machine(ser, machine)
-                        except Exception as e:
-                            print(f"[E220] poll_machine({machine['name']}) エラー: {e}")
-                    # ポーリング中に積まれたコマンドも処理
-                    while True:
-                        try:
-                            _handle_maint(ser, g_cmd_q.get_nowait())
-                        except queue.Empty:
-                            break
+                    with serial_lock:
+                        # メンテコマンドを優先処理（ポーリング前）
+                        while True:
+                            try:
+                                _handle_maint(ser, g_cmd_q.get_nowait())
+                            except queue.Empty:
+                                break
+                        # 通常ポーリング
+                        for machine in config['machines']:
+                            try:
+                                poll_machine(ser, machine)
+                            except Exception as e:
+                                print(f"[E220] poll_machine({machine['name']}) エラー: {e}")
+                        # ポーリング中に積まれたコマンドも処理
+                        while True:
+                            try:
+                                _handle_maint(ser, g_cmd_q.get_nowait())
+                            except queue.Empty:
+                                break
                     # 残り時間スリープ（1秒ごとにキューを確認して早期起床）
                     remaining = config['poll_interval_sec'] - (_time.time() - t0)
                     deadline = _time.time() + max(0, remaining)
@@ -246,6 +283,7 @@ def polling_loop():
                             break
         except Exception as e:
             print(f"[E220] {e}  5秒後に再接続…")
+            g_serial_obj = None
             _time.sleep(5)
 
 
@@ -1574,6 +1612,90 @@ def compat_hinmoku_info(date, hinmokuno):
                             date=date, hinmokuno=hinmokuno), 302)
 
 
+# ===== OTA ワーカー =====
+
+def _ota_recv(ser, timeout_sec=3.5):
+    """OTAレスポンス受信: CRLF終端まで読む（最大200B）"""
+    deadline = _time.time() + timeout_sec
+    buf = bytearray()
+    while _time.time() < deadline:
+        if ser.in_waiting:
+            buf += ser.read(ser.in_waiting)
+            if len(buf) >= 4 and buf[-2] == 0x0D and buf[-1] == 0x0A:
+                return bytes(buf)
+        _time.sleep(0.005)
+    return None
+
+
+def _ota_worker(job_id, unit_addr, fw_bytes):
+    """バックグラウンドスレッドでOTA実行"""
+    CHUNK_SIZE  = 128
+    total_size  = len(fw_bytes)
+    total_crc32 = zlib.crc32(fw_bytes) & 0xFFFFFFFF
+    num_chunks  = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    ch          = config['gw_channel']
+
+    def update(progress, status, message=''):
+        with g_ota_lock:
+            g_ota_jobs[job_id].update({'progress': progress, 'status': status, 'message': message})
+
+    update(0, 'running', 'OTA開始...')
+
+    try:
+        with serial_lock:
+            ser = g_serial_obj
+            if ser is None or not ser.is_open:
+                raise RuntimeError('シリアルポートが開いていません。GWを確認してください。')
+
+            # INIT 送信: UI(2B) + total_size(4B,BE) + total_crc32(4B,BE) + chunk_size(2B,BE) + reserved(1B) = 13B
+            init_pkt = (b'UI'
+                        + struct.pack('>I', total_size)
+                        + struct.pack('>I', total_crc32)
+                        + struct.pack('>H', CHUNK_SIZE)
+                        + b'\x00')
+            e220_send_payload(ser, unit_addr, ch, init_pkt)
+            resp = _ota_recv(ser, timeout_sec=4.0)
+            if resp is None or len(resp) < 4 or resp[2:4] != b'UR':
+                raise RuntimeError(f'INIT timeout (resp={resp!r})')
+            update(1, 'running', f'INIT OK. {num_chunks}チャンク送信開始...')
+            _time.sleep(0.3)
+
+            # DATA 送信ループ
+            for seq in range(num_chunks):
+                offset = seq * CHUNK_SIZE
+                chunk  = fw_bytes[offset:offset + CHUNK_SIZE]
+                crc16  = crc16_ccitt(chunk)
+                data_pkt = (b'UD'
+                            + struct.pack('>HHB', seq, crc16, len(chunk))
+                            + chunk)
+                e220_send_payload(ser, unit_addr, ch, data_pkt)
+                resp = _ota_recv(ser, timeout_sec=3.5)
+                if resp is None:
+                    raise RuntimeError(f'DATA timeout seq={seq}')
+                if len(resp) >= 4 and resp[2:4] == b'UN':
+                    err = resp[6] if len(resp) > 6 else 0
+                    raise RuntimeError(f'NACK seq={seq} err=0x{err:02X}')
+                _time.sleep(0.3)
+                progress = int((seq + 1) / num_chunks * 90) + 1
+                update(progress, 'running', f'{seq + 1}/{num_chunks} chunks')
+
+            # FIN 送信: UF(2B) + total_size(4B,BE)
+            fin_pkt = b'UF' + struct.pack('>I', total_size)
+            e220_send_payload(ser, unit_addr, ch, fin_pkt)
+            resp = _ota_recv(ser, timeout_sec=10.0)  # CRC32計算に時間がかかるため余裕を持つ
+            if resp is None:
+                raise RuntimeError('FIN timeout')
+            if len(resp) >= 4 and resp[2:4] == b'UF':
+                code = resp[4] if len(resp) > 4 else 0
+                raise RuntimeError(f'エッジからFAIL応答 code=0x{code:02X}')
+            if len(resp) < 4 or resp[2:4] != b'UD':
+                raise RuntimeError(f'FIN unexpected response: {resp!r}')
+            update(100, 'done', 'OTA完了。エッジが再起動中...')
+
+    except Exception as e:
+        update(0, 'failed', str(e))
+
+
 # ===== メンテナンス =====
 
 @app.route('/maintenance')
@@ -1628,6 +1750,94 @@ def api_maint_result(req_id):
             del g_results[req_id]
             return jsonify({'status': 'not_found'}), 404
         return jsonify(entry)
+
+
+# ===== OTA Flask ルート =====
+
+@app.route('/maintenance/ota')
+def ota_page():
+    return render_template('ota.html', machines=config['machines'])
+
+
+@app.route('/api/ota/upload', methods=['POST'])
+def ota_upload():
+    """バイナリアップロード → ジョブ登録（実行はまだしない）"""
+    f       = request.files.get('firmware')
+    machine = request.form.get('machine', '')
+    unit    = request.form.get('unit', 'patlite')  # 'patlite' or 'current'
+
+    if not f or not f.filename:
+        return jsonify({'error': 'ファームウェアファイルが指定されていません'}), 400
+    if not machine:
+        return jsonify({'error': '機械名が指定されていません'}), 400
+
+    fw_bytes = f.read()
+    if len(fw_bytes) == 0:
+        return jsonify({'error': 'ファイルが空です'}), 400
+    if len(fw_bytes) > 1 * 1024 * 1024:
+        return jsonify({'error': 'ファイルサイズが1MBを超えています'}), 400
+
+    # ターゲットアドレスを解決
+    target_machine = None
+    for m in config['machines']:
+        if m['name'] == machine:
+            target_machine = m
+            break
+    if target_machine is None:
+        return jsonify({'error': f'機械 {machine} が見つかりません'}), 404
+
+    unit_addr = target_machine['patlite_addr'] if unit == 'patlite' else target_machine['current_addr']
+
+    job_id = str(uuid.uuid4())
+    with g_ota_lock:
+        g_ota_jobs[job_id] = {
+            'status':    'uploaded',
+            'progress':  0,
+            'message':   'アップロード完了。OTA開始ボタンを押してください。',
+            'machine':   machine,
+            'unit':      unit,
+            'unit_addr': unit_addr,
+            'fw_size':   len(fw_bytes),
+            'fw_bytes':  fw_bytes,
+            'ts':        _time.time(),
+        }
+    return jsonify({'job_id': job_id, 'fw_size': len(fw_bytes)})
+
+
+@app.route('/api/ota/start/<job_id>', methods=['POST'])
+def ota_start(job_id):
+    """アップロード済みジョブを実行開始"""
+    with g_ota_lock:
+        job = g_ota_jobs.get(job_id)
+    if job is None:
+        return jsonify({'error': 'ジョブが見つかりません'}), 404
+    if job['status'] not in ('uploaded', 'failed'):
+        return jsonify({'error': f'ジョブは既に {job["status"]} 状態です'}), 400
+
+    # 実行中ジョブが他にないか確認
+    with g_ota_lock:
+        for jid, j in g_ota_jobs.items():
+            if jid != job_id and j.get('status') == 'running':
+                return jsonify({'error': '別のOTAジョブが実行中です'}), 409
+        g_ota_jobs[job_id]['status'] = 'running'
+
+    fw_bytes  = job['fw_bytes']
+    unit_addr = job['unit_addr']
+    threading.Thread(
+        target=_ota_worker, args=(job_id, unit_addr, fw_bytes), daemon=True
+    ).start()
+    return jsonify({'status': 'started'})
+
+
+@app.route('/api/ota/progress/<job_id>')
+def ota_progress(job_id):
+    with g_ota_lock:
+        job = g_ota_jobs.get(job_id)
+    if job is None:
+        return jsonify({'status': 'not_found'}), 404
+    # fw_bytes はレスポンスに含めない
+    safe = {k: v for k, v in job.items() if k != 'fw_bytes'}
+    return jsonify(safe)
 
 
 if __name__ == "__main__":

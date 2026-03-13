@@ -482,6 +482,75 @@ VREF=3.3V, 12bit → 1LSB = 0.806mV
 | USBシリアル経由設定 | PCからのコマンド | 将来実装 |
 | OTA受信 | GWからのOTAコマンド | 将来実装（Phase5） |
 
+## Phase 5: OTA プロトコル
+
+### フラッシュレイアウト（RP2040, 2MB）
+```
+0x000000 ─── Bank A (1MB): 現行ファーム（起動・実行）
+0x0FFFFF
+0x100000 ─── Bank B (1MB): OTA受信バッファ
+0x1FFFFF
+```
+- `XIP_BASE` = 0x10000000（メモリマップアドレス）、flash API は物理オフセットで操作
+- Bank B 物理オフセット = 0x100000
+- 書き込み単位: 256B ページ（`FLASH_PAGE_SIZE`）、消去単位: 4KB セクター（`FLASH_SECTOR_SIZE`）
+- **Arduino IDE での通常書き込みは Bank A (オフセット 0) に行われるため影響なし**
+
+### OTA 状態遷移
+```
+IDLE → (UI受信) → INIT: Bank B消去 → READY送信
+INIT → (UD受信ループ) → RECV: CRC16検証・Bank B書き込み → ACK/NACK
+RECV → (UF受信) → FIN: Bank全体CRC32検証 → マジック書き込み → DONE送信 → reboot
+RECV/FIN → (UA受信) → IDLE: マジック消去
+```
+
+### GW → Edge コマンド（payload フィールド）
+
+| コマンド | 識別子 | サイズ | フィールド |
+|---------|-------|------|-----------|
+| INIT    | `UI`  | 13B  | `UI` + total_size(4B,BE) + total_crc32(4B,BE) + chunk_size(2B,BE) + reserved(1B) |
+| DATA    | `UD`  | 7+N B | `UD` + seq(2B,BE) + chunk_crc16(2B,BE) + len(1B=128) + data(N B) |
+| FIN     | `UF`  | 6B   | `UF` + total_size(4B,BE) |
+| ABORT   | `UA`  | 4B   | `UA` + code(1B) + padding(1B) |
+
+最終チャンクは len < 128 の可能性あり（`UD` の len フィールドで通知）。
+
+### Edge → GW レスポンス
+
+| レスポンス | 識別子 | サイズ | フィールド |
+|----------|-------|------|-----------|
+| READY    | `UR`  | 8B   | `[ADDR_H][ADDR_L]UR` + chunk_size(2B,BE) + CR + LF |
+| ACK      | `UK`  | 10B  | `[ADDR_H][ADDR_L]UK` + seq(2B,BE) + next_seq(2B,BE) + CR + LF |
+| NACK     | `UN`  | 9B   | `[ADDR_H][ADDR_L]UN` + seq(2B,BE) + err(1B) + CR + LF |
+| DONE     | `UD`  | 10B  | `[ADDR_H][ADDR_L]UD` + crc32(4B,BE) + CR + LF |
+| FAIL     | `UF`  | 9B   | `[ADDR_H][ADDR_L]UF` + code(1B) + reason(2B) + CR + LF |
+
+### CRC
+- **チャンク単位**: CRC16-CCITT（poly=0x1021, init=0xFFFF）
+- **全体検証**: CRC32/IEEE（Python: `zlib.crc32(data) & 0xFFFFFFFF`）
+
+### OTA 適用フラグ（Bank B 末尾 16B）
+```
+XIP_BASE + 0x1FFFF0:  "OTA_READY"(9B) + fw_size(4B,BE) + padding(3B)
+```
+- `applyOTA_impl()` は RAM から実行（`__no_inline_not_in_flash_func`）
+- `multicore_lockout_start_blocking()` で Core1 を停止中に flash 操作
+- 適用後は `watchdog_reboot(0,0,0)` で即時再起動
+
+### タイムアウト・再送ポリシー
+- GW→Edge: 1チャンクあたり 3.5秒タイムアウト（RTT ~1.5s + 余裕 2s）
+- NACK 受信時: GW はエラーとして OTA 中止（手動リトライ方式）
+- FIN 後の DONE 待ち: 10秒（Bank B CRC32 計算時間を考慮）
+
+### OTA 所要時間目安（SF6/BW125kHz, RTT 1.5s/chunk）
+| チャンク数 | ファームサイズ | 合計時間 |
+|-----------|-------------|---------|
+| 156       | 20KB        | 約 4分  |
+| 781       | 100KB       | 約 20分 |
+| 1563      | 200KB       | 約 39分 |
+
+→ 実運用は深夜バッチ or 手動メンテ窓での実行を推奨。
+
 ## 既存GWとの差分（プロトタイプ → 本番）
 | 項目 | プロトタイプ | 本番 |
 |------|------------|------|

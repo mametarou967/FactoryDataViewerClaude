@@ -82,17 +82,19 @@
 - [x] Ping実行('K')・結果表示（個別 / 全台一括）
 - [x] バージョン確認('V')・結果表示（個別 / 全台一括）
 - [x] HW情報確認('H')・結果表示（DIP状態・E220設定値）
-- [ ] OTA実行('U')（Phase5で実装）
+- [x] OTA実行('U')（Phase5で実装）
 
 ### Step4: 運用対応
 - [ ] systemdサービス設定（Restart=always）
 - [ ] server_file_copy.py のcron設定
 
-## Phase 5: OTA（任意・最後）
-- [ ] ブートローダー設計（新ファームをFlashに書込み・検証・切替）
-- [ ] GW側OTA配信ロジック
-- [ ] パケット分割・CRC検証・再送制御
-- [ ] ロールバック機能
+## Phase 5: OTA（任意・最後） ✅
+- [x] ブートローダー設計（デュアルバンク: Bank A=稼働中, Bank B=OTAバッファ）
+- [x] GW側OTA配信ロジック（_ota_worker スレッド + Flask OTAルート）
+- [x] パケット分割・CRC検証（CRC16チャンク単位 + CRC32全体）・NACK再送制御
+- [x] ロールバック機能（Bank Bのマジック書き込み後に applyOTA_impl で Bank A を上書き・再起動）
+- [x] OTA操作画面（gateway/templates/ota.html）
+- [x] フラッシュレイアウト・プロトコル仕様 → spec/design.md に記録
 
 ## 完了済み
 - [x] ハードウェア設計（KiCadスケマティック）

@@ -30,6 +30,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <pico/mutex.h>
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "pico/multicore.h"
 
 // ===== UIモード（インクルード直後に定義: Arduino自動プロトタイプ生成との衝突防止） =====
 enum UIMode : uint8_t {
@@ -44,6 +47,38 @@ enum UIMode : uint8_t {
 
 // ===== ボタンデバウンス構造体（pollBtnプロトタイプより前に定義必須） =====
 struct BtnState { bool prev; uint32_t lastMs; };
+
+// ===== OTA定数 =====
+#define OTA_BANK_OFFSET   0x100000UL   // Bank B 物理オフセット（フラッシュ1MB境界）
+#define OTA_CHUNK_SIZE    128
+#define OTA_MAX_FIRMWARE  (1 * 1024 * 1024)  // 1MB（Bank B サイズ）
+// Bank B 末尾のマジック領域: "OTA_READY"(9B) + fw_size(4B,BE) + 3B padding = 16B
+#define OTA_MAGIC_OFFSET  (OTA_BANK_OFFSET + OTA_MAX_FIRMWARE - 16)
+
+// ===== OTA状態機械 =====
+enum OtaState : uint8_t {
+    OTA_IDLE  = 0,
+    OTA_INIT,
+    OTA_RECV,
+    OTA_FIN,
+    OTA_DONE,
+    OTA_FAIL
+};
+
+struct OtaCtx {
+    OtaState state           = OTA_IDLE;
+    uint32_t total_size      = 0;
+    uint32_t total_crc32     = 0;
+    uint16_t chunk_size      = OTA_CHUNK_SIZE;
+    uint16_t expected_seq    = 0;
+    uint32_t written         = 0;
+    uint32_t chunks_rcvd     = 0;
+    // ページバッファ: CHUNK=128B、PAGE=256B → 2チャンク分貯めてから1ページ書き込む
+    uint8_t  page_buf[FLASH_PAGE_SIZE];  // 256B（staticグローバルなのでRAM配置確定）
+    uint16_t page_fill       = 0;        // 現ページに積んだバイト数
+    uint32_t page_base_off   = 0;        // 現ページのフラッシュ物理オフセット（ページ境界アライン済み）
+};
+static OtaCtx g_ota;
 
 // ===== Unit Type =====
 static const uint8_t UNIT_PATLITE = 0x01;
@@ -571,22 +606,360 @@ static void cmdCurrent() {
     Serial.printf("[C] Current: %.2f A\n", rms);
 }
 
+// ===== OTA CRC ユーティリティ =====
+static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t j = 0; j < 8; j++)
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+    }
+    return crc;
+}
+
+static uint32_t crc32_ieee(const uint8_t *data, uint32_t len) {
+    uint32_t crc = 0xFFFFFFFFUL;
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; j++)
+            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : (crc >> 1);
+    }
+    return crc ^ 0xFFFFFFFFUL;
+}
+
+// ===== applyOTA_impl: RAMから実行（flash操作中はXIPアクセス不可） =====
+// Bank B (物理オフセット OTA_BANK_OFFSET) → Bank A (物理オフセット 0) にコピーして再起動
+//
+// 重要: flash_range_program() 実行中は XIP が無効になるため、
+//       Bank B の XIP アドレス (XIP_BASE+OTA_BANK_OFFSET) を直接 data 引数に渡すと
+//       ハードフォルトする。各ページを flash 操作前にRAMバッファへコピーしてから渡す。
+void __no_inline_not_in_flash_func(applyOTA_impl)(uint32_t fw_size) {
+    // 0. Bank B のマジックセクターを最初に消去（再起動ループを防ぐ）
+    //    OTA_MAGIC_OFFSET(0x1FFFF0) が含まれるセクター先頭 = 0x1FF000
+    uint32_t magic_sector = OTA_MAGIC_OFFSET & ~((uint32_t)FLASH_SECTOR_SIZE - 1);
+    flash_range_erase(magic_sector, FLASH_SECTOR_SIZE);
+
+    // 1. Bank A を fw_size 分消去（この後 XIP は再有効化される）
+    uint32_t erase_size = (fw_size + FLASH_SECTOR_SIZE - 1) & ~(FLASH_SECTOR_SIZE - 1);
+    flash_range_erase(0, erase_size);
+
+    // 各ページ: XIPが有効な状態でRAMへコピー → flash_range_program はRAMから渡す
+    uint8_t ram_page[FLASH_PAGE_SIZE];  // スタック = RAM。この関数自体もRAM実行なので問題なし
+    for (uint32_t off = 0; off < fw_size; off += FLASH_PAGE_SIZE) {
+        uint32_t plen = fw_size - off;
+        if (plen > FLASH_PAGE_SIZE) plen = FLASH_PAGE_SIZE;
+        // flash_range_erase/program の間は XIP が再有効化されているので安全にコピー可能
+        const uint8_t *src = (const uint8_t *)(XIP_BASE + OTA_BANK_OFFSET + off);
+        memcpy(ram_page, src, plen);
+        if (plen < FLASH_PAGE_SIZE) memset(ram_page + plen, 0xFF, FLASH_PAGE_SIZE - plen);
+        flash_range_program(off, ram_page, FLASH_PAGE_SIZE);
+    }
+    // 再起動（ウォッチドッグ即時リセット）
+    watchdog_reboot(0, 0, 0);
+    while (true) tight_loop_contents();
+}
+
+// ===== OTA: Bank B末尾マジック書き込み =====
+// フォーマット: "OTA_READY"(9B) + fw_size(4B,BE) + 3B padding
+// OTA_MAGIC_OFFSET は OTA_BANK_OFFSET+OTA_MAX_FIRMWARE-16 = 0x1FFFF0（ページ境界ではない）。
+// flash_range_program はページ境界アライン必須なので、OTA_MAGIC_OFFSET を含む
+// ページ先頭 (page_off) から書く。ページ内オフセット (intra) を計算してそこへマジックを配置する。
+static void otaWriteMagic(uint32_t fw_size) {
+    uint32_t page_off = OTA_MAGIC_OFFSET & ~(uint32_t)(FLASH_PAGE_SIZE - 1);
+    uint32_t intra    = OTA_MAGIC_OFFSET - page_off;  // ページ内オフセット (= 0xF0 = 240)
+
+    uint8_t magic_buf[FLASH_PAGE_SIZE];
+    memset(magic_buf, 0xFF, FLASH_PAGE_SIZE);  // 消去済み状態(0xFF)で初期化
+    uint8_t *p = magic_buf + intra;
+    p[0] = 'O'; p[1] = 'T'; p[2] = 'A';
+    p[3] = '_'; p[4] = 'R'; p[5] = 'E';
+    p[6] = 'A'; p[7] = 'D'; p[8] = 'Y';
+    p[9]  = (fw_size >> 24) & 0xFF;
+    p[10] = (fw_size >> 16) & 0xFF;
+    p[11] = (fw_size >>  8) & 0xFF;
+    p[12] = (fw_size >>  0) & 0xFF;
+
+    uint32_t ints = save_and_disable_interrupts();
+    multicore_lockout_start_blocking();
+    flash_range_program(page_off, magic_buf, FLASH_PAGE_SIZE);
+    multicore_lockout_end_blocking();
+    restore_interrupts(ints);
+}
+
+// ===== OTA: Bank B マジック消去 =====
+static void otaClearMagic() {
+    uint32_t page_off = OTA_MAGIC_OFFSET & ~(FLASH_SECTOR_SIZE - 1);
+    uint32_t ints = save_and_disable_interrupts();
+    multicore_lockout_start_blocking();
+    flash_range_erase(page_off, FLASH_SECTOR_SIZE);
+    multicore_lockout_end_blocking();
+    restore_interrupts(ints);
+}
+
+// ===== OTA ハンドラ =====
+
+// UI → GW: READY レスポンス
+// [ADDR_H][ADDR_L]['U']['R'][chunk_size_H][chunk_size_L][CR][LF]  8B
+static void sendOtaReady() {
+    uint16_t cs = OTA_CHUNK_SIZE;
+    uint8_t resp[] = {
+        g_e220.addH, g_e220.addL,
+        'U', 'R',
+        (uint8_t)(cs >> 8), (uint8_t)(cs & 0xFF),
+        '\r', '\n'
+    };
+    sendToGW(resp, sizeof(resp));
+}
+
+// UK: ACK
+// [ADDR_H][ADDR_L]['U']['K'][seq_H][seq_L][next_seq_H][next_seq_L][CR][LF]  10B
+static void sendOtaAck(uint16_t seq, uint16_t next_seq) {
+    uint8_t resp[] = {
+        g_e220.addH, g_e220.addL,
+        'U', 'K',
+        (uint8_t)(seq >> 8), (uint8_t)(seq & 0xFF),
+        (uint8_t)(next_seq >> 8), (uint8_t)(next_seq & 0xFF),
+        '\r', '\n'
+    };
+    sendToGW(resp, sizeof(resp));
+}
+
+// UN: NACK
+// [ADDR_H][ADDR_L]['U']['N'][seq_H][seq_L][err][CR][LF]  9B
+static void sendOtaNack(uint16_t seq, uint8_t err) {
+    uint8_t resp[] = {
+        g_e220.addH, g_e220.addL,
+        'U', 'N',
+        (uint8_t)(seq >> 8), (uint8_t)(seq & 0xFF),
+        err,
+        '\r', '\n'
+    };
+    sendToGW(resp, sizeof(resp));
+}
+
+// UD: DONE（FIN後のCRC確認完了）
+// [ADDR_H][ADDR_L]['U']['D'][crc32(4B,BE)][CR][LF]  10B
+static void sendOtaDone(uint32_t crc32) {
+    uint8_t resp[] = {
+        g_e220.addH, g_e220.addL,
+        'U', 'D',
+        (uint8_t)(crc32 >> 24), (uint8_t)(crc32 >> 16),
+        (uint8_t)(crc32 >>  8), (uint8_t)(crc32 &  0xFF),
+        '\r', '\n'
+    };
+    sendToGW(resp, sizeof(resp));
+}
+
+// UF: FAIL
+// [ADDR_H][ADDR_L]['U']['F'][code][reason_H][reason_L][CR][LF]  9B
+static void sendOtaFail(uint8_t code, uint16_t reason) {
+    uint8_t resp[] = {
+        g_e220.addH, g_e220.addL,
+        'U', 'F',
+        code,
+        (uint8_t)(reason >> 8), (uint8_t)(reason & 0xFF),
+        '\r', '\n'
+    };
+    sendToGW(resp, sizeof(resp));
+}
+
+// INIT: UI(2B) + total_size(4B,BE) + total_crc32(4B,BE) + chunk_size(2B,BE) + reserved(1B) = 13B
+static void handleOtaInit(const uint8_t *buf, int len) {
+    if (len < 13) { sendOtaFail(0x01, len); return; }
+    uint32_t total_size  = ((uint32_t)buf[2] << 24) | ((uint32_t)buf[3] << 16)
+                         | ((uint32_t)buf[4] <<  8) | buf[5];
+    uint32_t total_crc32 = ((uint32_t)buf[6] << 24) | ((uint32_t)buf[7] << 16)
+                         | ((uint32_t)buf[8] <<  8) | buf[9];
+    // uint16_t chunk_size  = ((uint16_t)buf[10] << 8) | buf[11];  // 将来拡張用
+
+    if (total_size == 0 || total_size > OTA_MAX_FIRMWARE - 16) {
+        sendOtaFail(0x02, 0); return;
+    }
+
+    Serial.printf("[OTA] INIT total=%lu crc32=0x%08lX\n", total_size, total_crc32);
+
+    // Bank B 全体を消去（Core1停止中に実行）
+    uint32_t ints = save_and_disable_interrupts();
+    multicore_lockout_start_blocking();
+    flash_range_erase(OTA_BANK_OFFSET, OTA_MAX_FIRMWARE);
+    multicore_lockout_end_blocking();
+    restore_interrupts(ints);
+
+    g_ota.state          = OTA_RECV;
+    g_ota.total_size     = total_size;
+    g_ota.total_crc32    = total_crc32;
+    g_ota.chunk_size     = OTA_CHUNK_SIZE;
+    g_ota.expected_seq   = 0;
+    g_ota.written        = 0;
+    g_ota.chunks_rcvd    = 0;
+    g_ota.page_fill      = 0;
+    g_ota.page_base_off  = 0;
+    memset(g_ota.page_buf, 0xFF, FLASH_PAGE_SIZE);
+
+    sendOtaReady();
+    onRxSuccess();
+    Serial.println("[OTA] Bank B erased. READY sent.");
+}
+
+// DATA: UD(2B) + seq(2B,BE) + chunk_crc16(2B,BE) + len(1B) + data(len B)
+static void handleOtaData(const uint8_t *buf, int pktlen) {
+    if (g_ota.state != OTA_RECV) {
+        sendOtaNack(0, 0x10); return;
+    }
+    if (pktlen < 7) { sendOtaNack(0, 0x11); return; }
+
+    uint16_t seq      = ((uint16_t)buf[2] << 8) | buf[3];
+    uint16_t rcrc16   = ((uint16_t)buf[4] << 8) | buf[5];
+    uint8_t  dlen     = buf[6];
+
+    if (pktlen < 7 + (int)dlen) { sendOtaNack(seq, 0x12); return; }
+
+    const uint8_t *data = buf + 7;
+
+    // seq チェック（重複は ACK 返して無視、先行はエラー）
+    if (seq != g_ota.expected_seq) {
+        Serial.printf("[OTA] seq mismatch: got %d, expect %d\n", seq, g_ota.expected_seq);
+        sendOtaNack(seq, 0x20);
+        return;
+    }
+
+    // CRC16 検証
+    uint16_t calc_crc = crc16_ccitt(data, dlen);
+    if (calc_crc != rcrc16) {
+        Serial.printf("[OTA] CRC16 mismatch seq=%d: got 0x%04X calc 0x%04X\n",
+                      seq, rcrc16, calc_crc);
+        sendOtaNack(seq, 0x30);
+        return;
+    }
+
+    // ページバッファに積む
+    // CHUNK=128B, PAGE=256B → 2チャンクで1ページ。ページ境界をまたがないよう管理する。
+    uint32_t seq_off  = OTA_BANK_OFFSET + (uint32_t)seq * OTA_CHUNK_SIZE;
+    uint32_t page_off = seq_off & ~(uint32_t)(FLASH_PAGE_SIZE - 1);  // 256B境界切り捨て
+    uint16_t intra    = (uint16_t)(seq_off - page_off);               // ページ内オフセット（0 or 128）
+
+    if (intra == 0) {
+        // 新しいページの先頭チャンク: バッファを0xFF（消去済み）でリセット
+        memset(g_ota.page_buf, 0xFF, FLASH_PAGE_SIZE);
+        g_ota.page_base_off = page_off;
+        g_ota.page_fill     = 0;
+    }
+    memcpy(g_ota.page_buf + intra, data, dlen);
+    g_ota.page_fill += dlen;
+
+    // ページが満杯 or 最終チャンク → フラッシュに書き込む
+    bool last_chunk = ((g_ota.written + dlen) >= g_ota.total_size);
+    if (g_ota.page_fill >= FLASH_PAGE_SIZE || last_chunk) {
+        // 最終チャンクでページ未満の場合、残りを 0xFF（消去済みと同値）で明示パディング
+        if (g_ota.page_fill < FLASH_PAGE_SIZE) {
+            memset(g_ota.page_buf + g_ota.page_fill, 0xFF,
+                   FLASH_PAGE_SIZE - g_ota.page_fill);
+        }
+        uint32_t ints = save_and_disable_interrupts();
+        multicore_lockout_start_blocking();
+        flash_range_program(g_ota.page_base_off, g_ota.page_buf, FLASH_PAGE_SIZE);
+        multicore_lockout_end_blocking();
+        restore_interrupts(ints);
+        g_ota.page_fill = 0;
+    }
+
+    g_ota.written     += dlen;
+    g_ota.chunks_rcvd++;
+    g_ota.expected_seq = seq + 1;
+
+    Serial.printf("[OTA] DATA seq=%d len=%d written=%lu\n", seq, dlen, g_ota.written);
+    sendOtaAck(seq, g_ota.expected_seq);
+    onRxSuccess();
+}
+
+// FIN: UF(2B) + total_size(4B,BE)
+static void handleOtaFin(const uint8_t *buf, int len) {
+    if (g_ota.state != OTA_RECV) {
+        sendOtaFail(0x40, 0); return;
+    }
+    if (len < 6) { sendOtaFail(0x41, len); return; }
+
+    uint32_t fin_size = ((uint32_t)buf[2] << 24) | ((uint32_t)buf[3] << 16)
+                      | ((uint32_t)buf[4] <<  8) | buf[5];
+
+    if (fin_size != g_ota.total_size) {
+        sendOtaFail(0x42, 0); return;
+    }
+    if (g_ota.written < g_ota.total_size) {
+        Serial.printf("[OTA] FIN: written=%lu < total=%lu\n",
+                      g_ota.written, g_ota.total_size);
+        sendOtaFail(0x43, 0); return;
+    }
+
+    // Bank B の CRC32 計算
+    const uint8_t *bank_b = (const uint8_t *)(XIP_BASE + OTA_BANK_OFFSET);
+    uint32_t calc_crc32 = crc32_ieee(bank_b, g_ota.total_size);
+
+    if (calc_crc32 != g_ota.total_crc32) {
+        Serial.printf("[OTA] CRC32 mismatch: got 0x%08lX calc 0x%08lX\n",
+                      g_ota.total_crc32, calc_crc32);
+        g_ota.state = OTA_FAIL;
+        sendOtaFail(0x44, 0);
+        return;
+    }
+
+    // マジックワードをBank B末尾に書き込んでOTA適用フラグ立て
+    otaWriteMagic(g_ota.total_size);
+    g_ota.state = OTA_DONE;
+
+    Serial.printf("[OTA] FIN OK. crc32=0x%08lX. Rebooting...\n", calc_crc32);
+    sendOtaDone(calc_crc32);
+    onRxSuccess();
+
+    // 少し待ってから再起動（GWがDONEを受け取れるように）
+    delay(500);
+    uint32_t ints = save_and_disable_interrupts();
+    multicore_lockout_start_blocking();
+    applyOTA_impl(g_ota.total_size);
+    // ここには戻らない
+}
+
+// ABORT: UA(2B) + code(1B) + padding(1B)
+static void handleOtaAbort(const uint8_t *buf, int len) {
+    (void)buf; (void)len;
+    Serial.println("[OTA] ABORT received. Clearing magic and resetting OTA state.");
+    if (g_ota.state != OTA_IDLE) {
+        otaClearMagic();
+    }
+    g_ota = OtaCtx{};  // リセット
+    // ABORTへの応答は不要
+    onRxSuccess();
+}
+
 // ===== コマンド受信・ディスパッチ =====
 static void processCommand() {
-    uint8_t  buf[32];
+    uint8_t  buf[200];   // OTA DATAパケット(7+128=135B) + 余裕
     int      len = 0;
     uint32_t t   = millis();
 
+    // OTA DATAパケット(UD...)はCRLF終端なし・最大135B
+    // 通常パケットはCRLF終端あり・最大32B
+    // 受信判定: CRLF検出 または タイムアウト(OTA時は250ms)
+    uint32_t timeout = 100;
     while (len < (int)sizeof(buf)) {
         if (Serial2.available()) {
             uint8_t b = Serial2.read();
             buf[len++] = b;
+            // 先頭2バイト確定後にタイムアウトを調整
+            if (len == 2 && buf[0] == 'U' && buf[1] == 'D') {
+                timeout = 250;  // OTA DATAパケット用に延長
+            }
             if (len >= 3 && buf[len - 2] == '\r' && buf[len - 1] == '\n') break;
+            // OTA DATAパケット: len(buf[6])バイト分のdataを受信し終えたら完了
+            if (len >= 7 && buf[0] == 'U' && buf[1] == 'D') {
+                uint8_t dlen = buf[6];
+                if (len >= 7 + (int)dlen) break;
+            }
         }
-        if (millis() - t > 100) break;
+        if (millis() - t > timeout) break;
     }
 
-    if (len < 3) return;
+    if (len < 2) return;
 
     hexDump("[RX]", buf, len);
     uint8_t cmd = buf[0];
@@ -596,8 +969,18 @@ static void processCommand() {
         case 'K': cmdPing();               break;
         case 'V': cmdVersion();            break;
         case 'H': cmdHwInfo();             break;
-        case 'P': cmdPatlite(); break;
-        case 'C': cmdCurrent(); break;
+        case 'P': cmdPatlite();            break;
+        case 'C': cmdCurrent();            break;
+        case 'U': {
+            if (len < 2) { cmdError(ERR_UNKNOWN_CMD); return; }
+            char sub = (char)buf[1];
+            if      (sub == 'I') handleOtaInit(buf, len);
+            else if (sub == 'D') handleOtaData(buf, len);
+            else if (sub == 'F') handleOtaFin(buf, len);
+            else if (sub == 'A') handleOtaAbort(buf, len);
+            else                 cmdError(ERR_UNKNOWN_CMD);
+            break;
+        }
         default:  cmdError(ERR_UNKNOWN_CMD); break;
     }
 }
@@ -1049,6 +1432,23 @@ void setup() {
     // ---- mutex は最初に初期化（Core1起動前に必須） ----
     mutex_init(&g_mutex);
 
+    // ---- OTA適用チェック（Core1起動前・Serial初期化前に実行） ----
+    // Bank B末尾にマジック"OTA_READY"があればapplyOTA_implを呼び出す
+    // (Core1はまだ起動していないためmulticore_lockout不要)
+    {
+        const uint8_t *magic = (const uint8_t *)(XIP_BASE + OTA_MAGIC_OFFSET);
+        if (magic[0] == 'O' && magic[1] == 'T' && magic[2] == 'A' &&
+            magic[3] == '_' && magic[4] == 'R' && magic[5] == 'E' &&
+            magic[6] == 'A' && magic[7] == 'D' && magic[8] == 'Y') {
+            uint32_t fw_size = ((uint32_t)magic[9]  << 24) | ((uint32_t)magic[10] << 16)
+                             | ((uint32_t)magic[11] <<  8) | magic[12];
+            // Serial未初期化のためログ出力不可。即座に適用。
+            uint32_t ints = save_and_disable_interrupts();
+            applyOTA_impl(fw_size);
+            // ここには戻らない
+        }
+    }
+
     Serial.begin(115200);
     uint32_t t0 = millis();
     while (!Serial && millis() - t0 < 5000) delay(10);
@@ -1261,6 +1661,10 @@ void loop() {
 // ===== Core1 =====
 // Wire/センサーはCore0のsetup()で初期化済み。Core1はWireを排他的に使用する。
 void setup1() {
+    // Core1をflash操作中のロックアウトに対応させる
+    // (handleOtaInit等がmulticore_lockout_start_blockingを使うために必要)
+    multicore_lockout_victim_init();
+
     // Core0のsetup()完了を待ってからloop1()を開始する。
     // arduino-picoはCore0のsetup()より前にCore1を起動するため、
     // g_tsl_ok[]等の共有変数をCore0が初期化し終わるまで待つ必要がある。
