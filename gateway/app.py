@@ -1705,7 +1705,8 @@ def _ota_worker(job_id, unit_addr, fw_bytes):
                         + struct.pack('>H', CHUNK_SIZE)
                         + b'\x00')
             e220_send_payload(ser, unit_addr, ch, init_pkt)
-            resp = _ota_recv(ser, timeout_sec=4.0)
+            # Bank B 1MB 消去 (16×64KBブロック): 典型 ~3s、最悪 ~25s のため余裕を持つ
+            resp = _ota_recv(ser, timeout_sec=60.0)
             if resp is None or len(resp) < 4 or resp[2:4] != b'UR':
                 raise RuntimeError(f'INIT timeout (resp={resp!r})')
             update(1, 'running', f'INIT OK. {num_chunks}チャンク送信開始...')
