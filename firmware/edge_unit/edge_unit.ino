@@ -165,8 +165,8 @@ static const uint8_t PIN_LED_D1    = 28;
 
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
-static const uint8_t FW_MINOR = 3;
-static const uint8_t FW_PATCH = 3;
+static const uint8_t FW_MINOR = 4;
+static const uint8_t FW_PATCH = 4;
 
 // ===== Error Codes =====
 static const uint8_t ERR_SENSOR_FAIL = 0x01;
@@ -708,11 +708,15 @@ void __no_inline_not_in_flash_func(applyOTA_impl)(uint32_t fw_size) {
         if (plen < FLASH_PAGE_SIZE) ram_memset(ram_page + plen, 0xFF, FLASH_PAGE_SIZE - plen);
         flash_range_program(off, ram_page, FLASH_PAGE_SIZE);
     }
-    // 再起動: WATCHDOG TRIGGER ビット直接書き込み（即時リセット）
-    // watchdog_reboot(0,0,0) は watchdog_enable(delay=0) を呼び pico SDK が panic するため使わない。
-    // hw_set_bits はインライン展開されRAM上で実行 → Bank A 消去後でも安全。
-    hw_set_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_TRIGGER_BITS);
-    while (true) tight_loop_contents();
+    // 再起動: ARM Cortex-M0+ SYSRESETREQ（SCB->AIRCR 書き込み）
+    // - watchdog_reboot(0,0,0): pico SDK が panic → 使わない
+    // - hw_set_bits(WATCHDOG_CTRL_TRIGGER_BITS): RP2040 では機能しない → 使わない
+    // - SYSRESETREQ: Cortex-M0+ 標準の即時チップリセット命令
+    //   アドレス 0xE000ED0C = SCB->AIRCR
+    //   書き込み値 = (VECTKEY=0x05FA)<<16 | (SYSRESETREQ=1)<<2 = 0x05FA0004
+    //   インライン展開される単純なストア命令 → RAM実行・割り込み無効でも完全動作
+    *((volatile uint32_t*)0xE000ED0Cu) = 0x05FA0004u;
+    while (true) tight_loop_contents();  // SYSRESETREQ後はここに到達しない
 }
 
 // ===== OTA: Bank B末尾マジック書き込み =====
