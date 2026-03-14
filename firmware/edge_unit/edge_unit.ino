@@ -164,7 +164,7 @@ static const uint8_t PIN_LED_D1    = 28;
 
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
-static const uint8_t FW_MINOR = 2;
+static const uint8_t FW_MINOR = 3;
 static const uint8_t FW_PATCH = 0;
 
 // ===== Error Codes =====
@@ -290,6 +290,7 @@ static void serial2Begin(uint32_t baud) {
         // 初回のみ完全初期化（Serial2.end() は呼ばない）
         Serial2.setTX(PIN_LORA_TX);
         Serial2.setRX(PIN_LORA_RX);
+        Serial2.setFIFOSize(256);  // OTA DATAパケット(135B)受信のため拡張（デフォルト32Bでは溢れる）
         Serial2.begin(baud);
         g_serial2_inited = true;
     } else {
