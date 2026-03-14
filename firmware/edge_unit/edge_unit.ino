@@ -165,8 +165,8 @@ static const uint8_t PIN_LED_D1    = 28;
 
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
-static const uint8_t FW_MINOR = 5;
-static const uint8_t FW_PATCH = 5;
+static const uint8_t FW_MINOR = 6;
+static const uint8_t FW_PATCH = 0;
 
 // ===== Error Codes =====
 static const uint8_t ERR_SENSOR_FAIL = 0x01;
@@ -688,17 +688,24 @@ static void __no_inline_not_in_flash_func(ram_memset)(
 //       ハードフォルトする。各ページを flash 操作前にRAMバッファへコピーしてから渡す。
 // 重要2: Bank A 消去後は libc の memcpy/memset が呼べないため ram_memcpy/ram_memset を使う。
 void __no_inline_not_in_flash_func(applyOTA_impl)(uint32_t fw_size) {
+    // ===== STEP -1: Bank A 消去前にウォッチドッグを有効化 =====
+    // watchdog_enable() は Bank A (フラッシュ) にある SDK 関数。
+    // Bank A 消去後は呼び出せないため、消去前のこのタイミングで必ず呼ぶ。
+    // 全操作（消去+コピー ≈ 2秒）が終わった後、LOAD に最小値を書いて即時リセット。
+    watchdog_enable(5000, false);   // ← XIP 有効・Bank A 存在中に呼ぶ（タイムアウト 5000ms）
+
     // 0. Bank B のマジックセクターを最初に消去（再起動ループを防ぐ）
     //    OTA_MAGIC_OFFSET(0x1FFFF0) が含まれるセクター先頭 = 0x1FF000
     uint32_t magic_sector = OTA_MAGIC_OFFSET & ~((uint32_t)FLASH_SECTOR_SIZE - 1);
     flash_range_erase(magic_sector, FLASH_SECTOR_SIZE);
 
-    // 1. Bank A を fw_size 分消去（flash_range_erase はリターン前にXIPキャッシュを無効化する）
+    // 1. Bank A を fw_size 分消去
+    //    ※ この後 Bank A の SDK 関数は呼べない。ウォッチドッグは既に有効（STEP-1 で設定済み）。
     uint32_t erase_size = (fw_size + FLASH_SECTOR_SIZE - 1) & ~(FLASH_SECTOR_SIZE - 1);
     flash_range_erase(0, erase_size);
 
-    // 各ページ: XIPが有効な状態でRAMへコピー → flash_range_program はRAMから渡す
-    // ※ Bank A 消去後なので libc memcpy/memset は使えない → ram_memcpy/ram_memset を使う
+    // 2. Bank B → Bank A コピー
+    //    ※ Bank A 消去後なので libc memcpy/memset は使えない → ram_memcpy/ram_memset を使う
     uint8_t ram_page[FLASH_PAGE_SIZE];  // スタック = RAM。この関数自体もRAM実行なので問題なし
     for (uint32_t off = 0; off < fw_size; off += FLASH_PAGE_SIZE) {
         uint32_t plen = fw_size - off;
@@ -708,20 +715,12 @@ void __no_inline_not_in_flash_func(applyOTA_impl)(uint32_t fw_size) {
         if (plen < FLASH_PAGE_SIZE) ram_memset(ram_page + plen, 0xFF, FLASH_PAGE_SIZE - plen);
         flash_range_program(off, ram_page, FLASH_PAGE_SIZE);
     }
-    // 再起動: RP2040 ウォッチドッグ直接レジスタ書き込み
-    // - watchdog_reboot(0,0,0): pico SDK が panic("Watchdog delay out of range") → 使わない
-    // - hw_set_bits(WATCHDOG_CTRL_TRIGGER_BITS): RP2040 では機能しない (bit予約) → 使わない
-    // - ARM SYSRESETREQ (0xE000ED0C): RP2040 TRM でウォッチドッグ使用を明示要求 → 使わない
-    // - 正解: ウォッチドッグレジスタを直接操作（RAMから実行中なので安全）
-    //   WATCHDOG_BASE = 0x40058000
-    //   CLEAR alias   = WATCHDOG_BASE + 0x3000 = 0x4005B000
-    //   TICK          = WATCHDOG_BASE + 0x002C  = 0x4005802C
-    //   LOAD          = WATCHDOG_BASE + 0x0004  = 0x40058004
-    //   SET alias     = WATCHDOG_BASE + 0x2000  = 0x4005A000
-    *((volatile uint32_t*)(0x4005B000u)) = 0x40000000u;  // CLEAR ENABLE（念のため無効化）
-    *((volatile uint32_t*)(0x4005802Cu)) = 0x20Cu;        // TICK: CYCLES=12(12MHz XOSC→1MHz), ENABLE=1
-    *((volatile uint32_t*)(0x40058004u)) = 4000u;          // LOAD: 4000 ticks ≈ 2ms
-    *((volatile uint32_t*)(0x4005A000u)) = 0x40000000u;  // SET ENABLE → ~2ms後にリセット
+
+    // 3. コピー完了。LOAD に最小値(2)を書いてウォッチドッグを即時発火させる。
+    //    STEP-1 で watchdog_enable(5000) により CTRL.ENABLE=1 かつ TICK 動作中。
+    //    LOAD に書くと COUNT が即座に上書きされ、次のティック(≈1µs)でリセット発火。
+    //    WATCHDOG_BASE=0x40058000, LOAD offset=0x004
+    *((volatile uint32_t*)(0x40058004u)) = 2u;
     while (true) tight_loop_contents();  // WDT発火待ち（ここには到達しない）
 }
 
