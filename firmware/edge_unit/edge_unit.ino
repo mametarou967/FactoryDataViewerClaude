@@ -165,8 +165,8 @@ static const uint8_t PIN_LED_D1    = 28;
 
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
-static const uint8_t FW_MINOR = 4;
-static const uint8_t FW_PATCH = 4;
+static const uint8_t FW_MINOR = 5;
+static const uint8_t FW_PATCH = 5;
 
 // ===== Error Codes =====
 static const uint8_t ERR_SENSOR_FAIL = 0x01;
@@ -708,15 +708,21 @@ void __no_inline_not_in_flash_func(applyOTA_impl)(uint32_t fw_size) {
         if (plen < FLASH_PAGE_SIZE) ram_memset(ram_page + plen, 0xFF, FLASH_PAGE_SIZE - plen);
         flash_range_program(off, ram_page, FLASH_PAGE_SIZE);
     }
-    // 再起動: ARM Cortex-M0+ SYSRESETREQ（SCB->AIRCR 書き込み）
-    // - watchdog_reboot(0,0,0): pico SDK が panic → 使わない
-    // - hw_set_bits(WATCHDOG_CTRL_TRIGGER_BITS): RP2040 では機能しない → 使わない
-    // - SYSRESETREQ: Cortex-M0+ 標準の即時チップリセット命令
-    //   アドレス 0xE000ED0C = SCB->AIRCR
-    //   書き込み値 = (VECTKEY=0x05FA)<<16 | (SYSRESETREQ=1)<<2 = 0x05FA0004
-    //   インライン展開される単純なストア命令 → RAM実行・割り込み無効でも完全動作
-    *((volatile uint32_t*)0xE000ED0Cu) = 0x05FA0004u;
-    while (true) tight_loop_contents();  // SYSRESETREQ後はここに到達しない
+    // 再起動: RP2040 ウォッチドッグ直接レジスタ書き込み
+    // - watchdog_reboot(0,0,0): pico SDK が panic("Watchdog delay out of range") → 使わない
+    // - hw_set_bits(WATCHDOG_CTRL_TRIGGER_BITS): RP2040 では機能しない (bit予約) → 使わない
+    // - ARM SYSRESETREQ (0xE000ED0C): RP2040 TRM でウォッチドッグ使用を明示要求 → 使わない
+    // - 正解: ウォッチドッグレジスタを直接操作（RAMから実行中なので安全）
+    //   WATCHDOG_BASE = 0x40058000
+    //   CLEAR alias   = WATCHDOG_BASE + 0x3000 = 0x4005B000
+    //   TICK          = WATCHDOG_BASE + 0x002C  = 0x4005802C
+    //   LOAD          = WATCHDOG_BASE + 0x0004  = 0x40058004
+    //   SET alias     = WATCHDOG_BASE + 0x2000  = 0x4005A000
+    *((volatile uint32_t*)(0x4005B000u)) = 0x40000000u;  // CLEAR ENABLE（念のため無効化）
+    *((volatile uint32_t*)(0x4005802Cu)) = 0x20Cu;        // TICK: CYCLES=12(12MHz XOSC→1MHz), ENABLE=1
+    *((volatile uint32_t*)(0x40058004u)) = 4000u;          // LOAD: 4000 ticks ≈ 2ms
+    *((volatile uint32_t*)(0x4005A000u)) = 0x40000000u;  // SET ENABLE → ~2ms後にリセット
+    while (true) tight_loop_contents();  // WDT発火待ち（ここには到達しない）
 }
 
 // ===== OTA: Bank B末尾マジック書き込み =====
