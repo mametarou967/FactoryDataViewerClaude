@@ -32,6 +32,7 @@
 #include <pico/mutex.h>
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/watchdog.h"
 
 // ===== UIモード（インクルード直後に定義: Arduino自動プロトタイプ生成との衝突防止） =====
 enum UIMode : uint8_t {
@@ -165,7 +166,7 @@ static const uint8_t PIN_LED_D1    = 28;
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
 static const uint8_t FW_MINOR = 3;
-static const uint8_t FW_PATCH = 2;
+static const uint8_t FW_PATCH = 3;
 
 // ===== Error Codes =====
 static const uint8_t ERR_SENSOR_FAIL = 0x01;
@@ -707,8 +708,10 @@ void __no_inline_not_in_flash_func(applyOTA_impl)(uint32_t fw_size) {
         if (plen < FLASH_PAGE_SIZE) ram_memset(ram_page + plen, 0xFF, FLASH_PAGE_SIZE - plen);
         flash_range_program(off, ram_page, FLASH_PAGE_SIZE);
     }
-    // 再起動（ウォッチドッグ即時リセット）
-    watchdog_reboot(0, 0, 0);
+    // 再起動: WATCHDOG TRIGGER ビット直接書き込み（即時リセット）
+    // watchdog_reboot(0,0,0) は watchdog_enable(delay=0) を呼び pico SDK が panic するため使わない。
+    // hw_set_bits はインライン展開されRAM上で実行 → Bank A 消去後でも安全。
+    hw_set_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_TRIGGER_BITS);
     while (true) tight_loop_contents();
 }
 
