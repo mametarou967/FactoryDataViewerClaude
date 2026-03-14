@@ -165,7 +165,7 @@ static const uint8_t PIN_LED_D1    = 28;
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
 static const uint8_t FW_MINOR = 3;
-static const uint8_t FW_PATCH = 0;
+static const uint8_t FW_PATCH = 1;
 
 // ===== Error Codes =====
 static const uint8_t ERR_SENSOR_FAIL = 0x01;
@@ -666,31 +666,45 @@ static uint32_t crc32_ieee(const uint8_t *data, uint32_t len) {
     return crc ^ 0xFFFFFFFFUL;
 }
 
+// ===== RAM常駐バイト操作（applyOTA_impl が Bank A 消去後も安全に呼べるよう） =====
+// memcpy/memset は libc (Bank A フラッシュ) に置かれる。Bank A 消去後にそれらを呼ぶと
+// XIPキャッシュミス → 0xFF fetch → 不正命令 → HardFault となるため、
+// __no_inline_not_in_flash_func で同じく RAM 常駐にした独自版を使う。
+static void __no_inline_not_in_flash_func(ram_memcpy)(
+        uint8_t *dst, const uint8_t *src, uint32_t n) {
+    while (n--) *dst++ = *src++;
+}
+static void __no_inline_not_in_flash_func(ram_memset)(
+        uint8_t *dst, uint8_t v, uint32_t n) {
+    while (n--) *dst++ = v;
+}
+
 // ===== applyOTA_impl: RAMから実行（flash操作中はXIPアクセス不可） =====
 // Bank B (物理オフセット OTA_BANK_OFFSET) → Bank A (物理オフセット 0) にコピーして再起動
 //
 // 重要: flash_range_program() 実行中は XIP が無効になるため、
 //       Bank B の XIP アドレス (XIP_BASE+OTA_BANK_OFFSET) を直接 data 引数に渡すと
 //       ハードフォルトする。各ページを flash 操作前にRAMバッファへコピーしてから渡す。
+// 重要2: Bank A 消去後は libc の memcpy/memset が呼べないため ram_memcpy/ram_memset を使う。
 void __no_inline_not_in_flash_func(applyOTA_impl)(uint32_t fw_size) {
     // 0. Bank B のマジックセクターを最初に消去（再起動ループを防ぐ）
     //    OTA_MAGIC_OFFSET(0x1FFFF0) が含まれるセクター先頭 = 0x1FF000
     uint32_t magic_sector = OTA_MAGIC_OFFSET & ~((uint32_t)FLASH_SECTOR_SIZE - 1);
     flash_range_erase(magic_sector, FLASH_SECTOR_SIZE);
 
-    // 1. Bank A を fw_size 分消去（この後 XIP は再有効化される）
+    // 1. Bank A を fw_size 分消去（flash_range_erase はリターン前にXIPキャッシュを無効化する）
     uint32_t erase_size = (fw_size + FLASH_SECTOR_SIZE - 1) & ~(FLASH_SECTOR_SIZE - 1);
     flash_range_erase(0, erase_size);
 
     // 各ページ: XIPが有効な状態でRAMへコピー → flash_range_program はRAMから渡す
+    // ※ Bank A 消去後なので libc memcpy/memset は使えない → ram_memcpy/ram_memset を使う
     uint8_t ram_page[FLASH_PAGE_SIZE];  // スタック = RAM。この関数自体もRAM実行なので問題なし
     for (uint32_t off = 0; off < fw_size; off += FLASH_PAGE_SIZE) {
         uint32_t plen = fw_size - off;
         if (plen > FLASH_PAGE_SIZE) plen = FLASH_PAGE_SIZE;
-        // flash_range_erase/program の間は XIP が再有効化されているので安全にコピー可能
         const uint8_t *src = (const uint8_t *)(XIP_BASE + OTA_BANK_OFFSET + off);
-        memcpy(ram_page, src, plen);
-        if (plen < FLASH_PAGE_SIZE) memset(ram_page + plen, 0xFF, FLASH_PAGE_SIZE - plen);
+        ram_memcpy(ram_page, src, plen);
+        if (plen < FLASH_PAGE_SIZE) ram_memset(ram_page + plen, 0xFF, FLASH_PAGE_SIZE - plen);
         flash_range_program(off, ram_page, FLASH_PAGE_SIZE);
     }
     // 再起動（ウォッチドッグ即時リセット）
