@@ -165,7 +165,7 @@ static const uint8_t PIN_LED_D1    = 28;
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
 static const uint8_t FW_MINOR = 3;
-static const uint8_t FW_PATCH = 1;
+static const uint8_t FW_PATCH = 2;
 
 // ===== Error Codes =====
 static const uint8_t ERR_SENSOR_FAIL = 0x01;
