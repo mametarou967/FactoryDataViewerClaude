@@ -534,8 +534,11 @@ RECV/FIN → (UA受信) → IDLE: マジック消去
 XIP_BASE + 0x1FFFF0:  "OTA_READY"(9B) + fw_size(4B,BE) + padding(3B)
 ```
 - `applyOTA_impl()` は RAM から実行（`__no_inline_not_in_flash_func`）
-- `multicore_lockout_start_blocking()` で Core1 を停止中に flash 操作
-- 適用後は `watchdog_reboot(0,0,0)` で即時再起動
+- `requestCore1Pause()` で Core1 を協調停止（volatile フラグベース）
+  - ※ `multicore_lockout_victim_init()` は arduino-pico の SIO_IRQ_PROC1 ハンドラと衝突するため不使用
+- Bank A 消去**前**に `watchdog_enable(5000, false)` で WDT を有効化
+- Bank A 消去・Bank B→A コピー完了後、`WATCHDOG_LOAD` レジスタに 2 を直書きして即時リセット発火
+  - ※ Bank A 消去後は SDK 関数（`watchdog_reboot` 等）が呼べないためレジスタ直操作が必要
 
 ### タイムアウト・再送ポリシー
 - GW→Edge: 1チャンクあたり 3.5秒タイムアウト（RTT ~1.5s + 余裕 2s）
