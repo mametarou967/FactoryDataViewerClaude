@@ -14,3 +14,13 @@ machines:
       yellow: 200
       green: 200
     current_threshold: 3.0
+
+  - name: "A215"
+    patlite_addr: 0x0201
+    current_addr:  0x0202
+    hinmoku_prefix: "A215"   # 品目CSV: A215_YYYYMMDD.csv
+    patlite_thresholds:
+      red: 200
+      yellow: 200
+      green: 200
+    current_threshold: 3.0

@@ -166,7 +166,7 @@ static const uint8_t PIN_LED_D1    = 28;
 // ===== Firmware Version =====
 static const uint8_t FW_MAJOR = 1;
 static const uint8_t FW_MINOR = 6;
-static const uint8_t FW_PATCH = 0;
+static const uint8_t FW_PATCH = 2;
 
 // ===== Error Codes =====
 static const uint8_t ERR_SENSOR_FAIL = 0x01;
@@ -1115,6 +1115,11 @@ static void e220PrintConfig(const E220Config &cfg, const char *label) {
 }
 
 // ===== E220 設定チェック・自動書き込み =====
+// addH と channel は E220 モジュール自身の不揮発メモリに記憶されるため、
+// Pico 側で管理しない。ボタンUIによる変更（e220WriteConfig呼び出し）で
+// E220 が上書きした値をそのまま信頼する。
+// 未設定値（0x00/0xFF）の場合のみコンパイル時デフォルトを使用する。
+// reg0/reg1/reg3/addL はファームウェアで一意に決まるため常に確認・上書きする。
 static void e220ConfigureIfNeeded() {
     Serial.println("Reading E220 config (9600bps config mode)...");
     E220Config current = {};
@@ -1123,11 +1128,17 @@ static void e220ConfigureIfNeeded() {
     if (readOk) {
         e220PrintConfig(current, "[E220 current]");
 
-        bool match = (current.addH    == DESIRED_ADDH    &&
-                      current.addL    == DESIRED_ADDL    &&
-                      current.channel == DESIRED_CHANNEL &&
-                      current.reg0    == DESIRED_REG0    &&
-                      current.reg1    == DESIRED_REG1    &&
+        // addH/channel: E220の不揮発値を信頼。未設定(0x00/0xFF)時のみデフォルトを使用
+        uint8_t effectiveAddH    = (current.addH == 0x00 || current.addH == 0xFF)
+                                   ? DESIRED_ADDH : current.addH;
+        uint8_t effectiveChannel = (current.channel == 0xFF)
+                                   ? DESIRED_CHANNEL : current.channel;
+
+        bool match = (current.addH    == effectiveAddH    &&
+                      current.addL    == DESIRED_ADDL     &&
+                      current.channel == effectiveChannel &&
+                      current.reg0    == DESIRED_REG0     &&
+                      current.reg1    == DESIRED_REG1     &&
                       current.reg3    == DESIRED_REG3);
 
         if (match) {
@@ -1135,22 +1146,32 @@ static void e220ConfigureIfNeeded() {
             g_e220 = current;
             return;
         }
-        Serial.println("  Settings differ from desired. Writing...");
+        // reg0/reg1/reg3/addLが変わった場合でも addH/channel はE220の現在値を保持
+        Serial.println("  Settings differ. Writing (preserving addH/channel from E220)...");
+        E220Config desired = {
+            effectiveAddH, DESIRED_ADDL,
+            DESIRED_REG0, DESIRED_REG1, effectiveChannel, DESIRED_REG3
+        };
+        if (e220WriteConfig(desired)) {
+            g_e220 = desired;
+            e220PrintConfig(g_e220, "[E220 after write]");
+        } else {
+            Serial.println("  Write FAILED. Using desired values as-is.");
+            g_e220 = desired;
+        }
     } else {
         Serial.println("  Read FAILED. Attempting to write defaults...");
-    }
-
-    // 設定書き込み
-    E220Config desired = {
-        DESIRED_ADDH, DESIRED_ADDL,
-        DESIRED_REG0, DESIRED_REG1, DESIRED_CHANNEL, DESIRED_REG3
-    };
-    if (e220WriteConfig(desired)) {
-        g_e220 = desired;
-        e220PrintConfig(g_e220, "[E220 after write]");
-    } else {
-        Serial.println("  Write FAILED. Using desired values as-is.");
-        g_e220 = desired;
+        E220Config desired = {
+            DESIRED_ADDH, DESIRED_ADDL,
+            DESIRED_REG0, DESIRED_REG1, DESIRED_CHANNEL, DESIRED_REG3
+        };
+        if (e220WriteConfig(desired)) {
+            g_e220 = desired;
+            e220PrintConfig(g_e220, "[E220 after write]");
+        } else {
+            Serial.println("  Write FAILED. Using desired values as-is.");
+            g_e220 = desired;
+        }
     }
 }
 
