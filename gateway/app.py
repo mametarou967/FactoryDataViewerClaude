@@ -923,12 +923,18 @@ def index():
             "current_threshold": curr_thresh,
         })
 
-    # --- 現在の加工状況（最初の機械） ---
-    first_machine_config = config['machines'][0] if config['machines'] else None
-    first_machine_name   = first_machine_config['name'] if first_machine_config else None
-    current_work = get_current_processing_items(now=now, machine_config=first_machine_config)
+    # --- カレンダー・加工状況の対象機械（?machine= で切り替え可能、デフォルトは先頭） ---
+    all_machine_names    = [m['name'] for m in config['machines']]
+    default_machine_name = all_machine_names[0] if all_machine_names else None
+    selected_machine_name = request.args.get('machine', default_machine_name)
+    if selected_machine_name not in all_machine_names:
+        selected_machine_name = default_machine_name
+    selected_machine_config = next(
+        (m for m in config['machines'] if m['name'] == selected_machine_name), None
+    )
+    current_work = get_current_processing_items(now=now, machine_config=selected_machine_config)
 
-    # --- 年度カレンダー（最初の機械） ---
+    # --- 年度カレンダー（選択中の機械） ---
     if now.month >= 4:
         fiscal_start = datetime(now.year, 4, 1)
     else:
@@ -937,8 +943,8 @@ def index():
 
     existing_days   = set()
     existing_months = set()
-    if first_machine_name:
-        cal_dir = os.path.join(DATA_DIR, first_machine_name)
+    if selected_machine_name:
+        cal_dir = os.path.join(DATA_DIR, selected_machine_name)
         if os.path.isdir(cal_dir):
             for fname in os.listdir(cal_dir):
                 if fname.endswith(".csv"):
@@ -974,7 +980,9 @@ def index():
     return render_template(
         "index.html",
         machine_statuses=machine_statuses,
-        first_machine_name=first_machine_name,
+        first_machine_name=selected_machine_name,
+        all_machine_names=all_machine_names,
+        selected_machine_name=selected_machine_name,
         thresholds=THRESHOLDS,
         current_threshold=CURRENT_THRESHOLD,
         calendar=calendar,

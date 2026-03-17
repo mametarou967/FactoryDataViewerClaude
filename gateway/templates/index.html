@@ -77,6 +77,16 @@
             margin-bottom: 16px;
         }
 
+        /* 機械選択ボタン */
+        .machine-selector { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+        .machine-selector a {
+            padding: 4px 12px; border: 1px solid #aaa; border-radius: 4px;
+            background: #f5f5f5; color: #333; font-size: 13px;
+        }
+        .machine-selector a.active {
+            background: #0066cc; color: #fff; border-color: #0066cc;
+        }
+
         /* カレンダー */
         .calendar-grid {
             display: grid;
@@ -124,17 +134,22 @@
   </div>
 
   <!-- 現在の加工状況（最初の機械） + 年度カレンダー -->
-  {% if first_machine_name %}
+  {% if selected_machine_name %}
   <div class="topgrid">
     <!-- 左：年度カレンダー -->
     <div>
-      <h2 style="margin-top:0;">年度カレンダー（{{ calendar|length }}ヶ月分） ― {{ first_machine_name }}</h2>
+      <h2 style="margin-top:0;">年度カレンダー（{{ calendar|length }}ヶ月分） ― {{ selected_machine_name }}</h2>
+      <div class="machine-selector">
+        {% for name in all_machine_names %}
+          <a href="/?machine={{ name }}" class="{{ 'active' if name == selected_machine_name else '' }}">{{ name }}</a>
+        {% endfor %}
+      </div>
       <div class="calendar-grid">
         {% for ym, data in calendar.items() %}
           <div class="calendar-item">
             <h3>
               {% if data.month_link %}
-                <a href="/machine/{{ first_machine_name }}/month/{{ ym }}/overview">{{ ym }}</a>
+                <a href="/machine/{{ selected_machine_name }}/month/{{ ym }}/overview">{{ ym }}</a>
               {% else %}
                 {{ ym }}
               {% endif %}
@@ -156,7 +171,7 @@
                     {% set weekday = loop.index0 %}
                     <td class="{% if weekday == 5 %}saturday{% elif weekday == 6 %}sunday{% endif %}">
                       {% if day.link %}
-                        <a href="/machine/{{ first_machine_name }}/date/{{ day.date }}/overview">{{ day.day }}</a>
+                        <a href="/machine/{{ selected_machine_name }}/date/{{ day.date }}/overview">{{ day.day }}</a>
                       {% else %}
                         {{ day.day }}
                       {% endif %}
@@ -173,7 +188,7 @@
 
     <!-- 右：現在の加工状況 -->
     <div class="card">
-      <h2>現在の加工状況 ― {{ first_machine_name }}</h2>
+      <h2>現在の加工状況 ― {{ selected_machine_name }}</h2>
       {% if current_work['has_csv'] %}
         {% if current_work['items'] %}
           <div class="mini">本日 {{ today }} の「開始/停止のいずれかの区間」に現在時刻が含まれる品目を列として表示しています。</div>
@@ -244,11 +259,11 @@
                     <th class="sticky-left">リンク</th>
                     {% for it in current_work['items'] %}
                       <td>
-                        <a href="/machine/{{ first_machine_name }}/date/{{ today }}/hinmoku/{{ it.index }}">グラフ</a>
+                        <a href="/machine/{{ selected_machine_name }}/date/{{ today }}/hinmoku/{{ it.index }}">グラフ</a>
                         <span class="divider">|</span>
-                        <a href="/machine/{{ first_machine_name }}/date/{{ today }}/hinmoku/{{ it.index }}/summary">集計</a>
+                        <a href="/machine/{{ selected_machine_name }}/date/{{ today }}/hinmoku/{{ it.index }}/summary">集計</a>
                         <span class="divider">|</span>
-                        <a href="/machine/{{ first_machine_name }}/date/{{ today }}/hinmoku/{{ it.index }}/info">手配情報</a>
+                        <a href="/machine/{{ selected_machine_name }}/date/{{ today }}/hinmoku/{{ it.index }}/info">手配情報</a>
                       </td>
                     {% endfor %}
                   </tr>
